@@ -3,7 +3,9 @@
 //
 // The kernel's machine_idle() calls pmDispatch->MachineIdle() on every idle entry
 // of every CPU once a table is registered and initComplete() has run. Our table
-// sets only MachineIdle; every other slot stays NULL so all other kernel paths
+// sets MachineIdle plus store-only get/setMaxIntDelay and get/setMaxBusDelay
+// (latency requests, which keep the hook out of CC6 while they are tighter than
+// its exit latency); every other slot stays NULL so all other kernel paths
 // behave exactly as with no PM kext (docs/research/xnu-pm.md §4, §9).
 //
 // Lifetime: a registration cannot be undone through any exported API, so it
@@ -31,6 +33,8 @@ struct HookConfig {
     uint16_t port;            // CStateAddr + k, 0 when maxMode < kIdleCc6
     bool     mwait;           // MONITOR/MWAIT with IF=0 usable
     uint64_t thresholdTicks;  // deep/shallow threshold (TSC ticks)
+    uint32_t ncpu;            // logical CPUs (all-cores-deep accounting)
+    uint64_t deepLatencyNs;   // CC6 exit latency compared with latency requests
 };
 
 // True once pmKextRegister has been called in this boot (by any instance).
@@ -54,6 +58,21 @@ uint16_t port();
 
 // Sum of the per-CPU counters of CPUs 0..ncpu-1.
 void totals(IdleTotals *out, uint32_t ncpu);
+
+// True while the kernel actually calls our MachineIdle (registered, initComplete
+// ran and the slot is not cleared by unhook()). Only then is snapshot() meaningful.
+bool active();
+// Latest latency requests the kernel handed to the table (ns, 0 = none).
+void latencyRequests(uint64_t *maxIntDelayNs, uint64_t *maxBusDelayNs);
+
+// Governor sampling without an IPI: per-CPU idle time accounted up to TSC `now`
+// (closed periods plus the open one) and the number of idle exits. Lock-free
+// (per-CPU seqcount), callable from thread context on any CPU.
+struct CpuIdleSnap {
+    uint64_t idleAcc;
+    uint64_t entries;
+};
+void snapshot(CpuIdleSnap *out, uint32_t ncpu, uint64_t now);
 
 // Evaluate _CST of processor 0 (AppleACPICPU IOCPUNumber 0 -> its
 // IOACPIPlatformDevice provider). Returns true if _CST returned a package; the

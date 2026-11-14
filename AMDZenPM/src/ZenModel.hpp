@@ -126,7 +126,8 @@ struct GovTunables {
     uint32_t samplingDownFactor; // ticks to hold before stepping down (>=1)
     uint32_t freqStepPct;        // conservative step % of max
     uint32_t utilHeadroomPct;    // schedutil 125
-    uint32_t utilEwmaShift;      // 0 = no smoothing; else ewma += (x-ewma)>>shift
+    uint32_t utilEwmaShift;      // 0 = no smoothing; else decays by (ewma-x)>>shift (rises at once)
+    uint32_t fastUpPct;          // schedutil: busy >= this % -> fastest at once (0 = off, default 60)
 };
 void defaultTunables(GovTunables *t);
 
@@ -148,6 +149,10 @@ uint32_t closestPState(const PStateTable &t, uint32_t targetMHz);
 // Legacy backend decision. util1024 = max frequency-invariant util of the core's
 // threads (reference = P0 freq), busyPermille = max C0 residency of the threads.
 // Returns the P-state index to request. userIdx is used for kAMDZenGovUserspace.
+// Frequency-invariant util (0..1024, relative to refMHz) of a core that was busy
+// busyPermille of the window while running at curMHz (no APERF available).
+uint32_t utilFromBusy(uint32_t busyPermille, uint32_t curMHz, uint32_t refMHz);
+
 uint32_t governLegacy(uint32_t governor, const GovTunables &tun, const PStateTable &t,
                       GovState *st, uint32_t util1024, uint32_t busyPermille, uint32_t userIdx);
 

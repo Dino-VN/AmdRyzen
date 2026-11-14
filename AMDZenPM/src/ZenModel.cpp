@@ -359,6 +359,21 @@ uint32_t ewmaStep(uint32_t ewma, uint32_t x, uint32_t shift)
     return ewma - ((ewma - x + round) >> shift);
 }
 
+// schedutil util smoothing: a rise is taken at once (like util_est), a fall decays
+// by (ewma - x) >> shift per tick, so a burst is never diluted on the way up.
+uint32_t utilFilter(uint32_t ewma, uint32_t x, uint32_t shift)
+{
+    return x >= ewma ? x : ewmaStep(ewma, x, shift);
+}
+
+// schedutil fast-up: a core busy for at least fastUpPct of the window goes
+// straight to the fastest allowed state (ondemand-style), whatever the slow
+// frequency-invariant util says.
+bool fastUp(const GovTunables &tun, uint32_t busyPermille)
+{
+    return tun.fastUpPct != 0 && busyPermille >= umin32(tun.fastUpPct, 100) * 10u;
+}
+
 // Hold logic shared by schedutil / ondemand (legacy and CPPC). The caller says
 // whether `next` lowers performance. Decreases are deferred while holdTicks > 0;
 // every non-decrease re-arms the hold to factor-1 ticks, so after the last tick
@@ -666,6 +681,7 @@ void defaultTunables(GovTunables *t)
     t->freqStepPct = 5;
     t->utilHeadroomPct = 125;
     t->utilEwmaShift = 1;
+    t->fastUpPct = 60;
 }
 
 uint32_t resolvePState(const PStateTable &t, uint32_t targetMHz)
@@ -695,6 +711,16 @@ uint32_t closestPState(const PStateTable &t, uint32_t targetMHz)
         }
     }
     return best;
+}
+
+uint32_t utilFromBusy(uint32_t busyPermille, uint32_t curMHz, uint32_t refMHz)
+{
+    if (refMHz == 0)
+        return 0;
+    if (busyPermille > 1000)
+        busyPermille = 1000;
+    uint64_t u = (uint64_t)busyPermille * 1024u * curMHz / (1000ull * refMHz);
+    return u > 1024 ? 1024 : (uint32_t)u;
 }
 
 uint32_t governLegacy(uint32_t governor, const GovTunables &tun, const PStateTable &t,
@@ -730,10 +756,14 @@ uint32_t governLegacy(uint32_t governor, const GovTunables &tun, const PStateTab
         next = clampIdx(userIdx, r);
         break;
     case kAMDZenGovSchedutil: {
-        st->utilEwma = ewmaStep(st->utilEwma, util1024, tun.utilEwmaShift);
-        uint32_t util = st->utilEwma;
-        uint64_t target = (uint64_t)tun.utilHeadroomPct * cpuinfoMax(t) * util / (100u * 1024u);
-        uint32_t want = resolvePState(t, sat32(target));
+        st->utilEwma = utilFilter(st->utilEwma, util1024, tun.utilEwmaShift);
+        uint32_t want;
+        if (fastUp(tun, busyPermille)) {
+            want = r.lo;
+        } else {
+            uint64_t target = (uint64_t)tun.utilHeadroomPct * cpuinfoMax(t) * st->utilEwma / (100u * 1024u);
+            want = resolvePState(t, sat32(target));
+        }
         next = applyHold(st, cur, want, want > cur, factor);
         break;
     }
@@ -831,11 +861,11 @@ uint32_t governCppcDesired(uint32_t governor, const GovTunables &tun, uint32_t m
         next = clampPerf(userPerf);
         break;
     case kAMDZenGovSchedutil: {
-        st->utilEwma = ewmaStep(st->utilEwma, util1024, tun.utilEwmaShift);
+        st->utilEwma = utilFilter(st->utilEwma, util1024, tun.utilEwmaShift);
         // maxPerf is the scale reference (util1024 is relative to highest perf).
         uint64_t num = (uint64_t)tun.utilHeadroomPct * maxPerf * st->utilEwma;
         uint64_t den = 100u * 1024u;
-        uint32_t want = clampPerf(sat32((num + den - 1) / den));
+        uint32_t want = fastUp(tun, busyPermille) ? maxPerf : clampPerf(sat32((num + den - 1) / den));
         next = applyHold(st, cur, want, want < cur, factor);
         break;
     }

@@ -198,6 +198,27 @@ static inline bool idlePredictDeep(uint64_t ewma, uint64_t thresholdTicks) {
 static inline uint64_t idleClampTicks(uint64_t thresholdTicks) {
     return thresholdTicks * kIdleClampMult;
 }
+// Latency requests (ml_set_maxintdelay / ml_set_maxbusdelay, i.e. IOService
+// requireMaxInterruptDelay / requireMaxBusStall; abs time = ns on x86). A request
+// of 0 means "no constraint". CC6 is allowed only if every active request
+// tolerates its exit latency; otherwise the hook stays in C1.
+constexpr uint32_t kIdleDeepLatencyDefaultUs = 100;   // no _CST latency: be conservative
+static inline bool idleLatencyAllowsDeep(uint64_t maxIntDelayNs, uint64_t maxBusDelayNs,
+                                         uint64_t deepLatencyNs) {
+    return (maxIntDelayNs == 0 || maxIntDelayNs >= deepLatencyNs) &&
+           (maxBusDelayNs == 0 || maxBusDelayNs >= deepLatencyNs);
+}
+// Exit latency (us) of the _CST entry the hook uses; the default when unknown.
+uint32_t idleDeepLatencyUs(const CstEntry *cst, uint32_t n, int32_t cstIndex);
+
+// All-cores-in-CC6 accounting. The CPU whose deep entry made every CPU deep stamps
+// `start`; the first CPU to leave adds exit - start. A stamp is only trusted if it
+// lies inside the leaving CPU's own deep period (it was deep the whole time), which
+// rejects a stale stamp from a lost race. Returns the span to add, 0 if rejected.
+static inline uint64_t idleAllDeepSpan(uint64_t ownEntry, uint64_t start, uint64_t exit) {
+    return (start >= ownEntry && exit > start) ? exit - start : 0;
+}
+
 // us * tscHz / 1e6 (us <= 1e6 and tscHz < 2^43 cannot overflow).
 uint64_t usToTscTicks(uint32_t us, uint64_t tscHz);
 
@@ -205,11 +226,23 @@ uint64_t usToTscTicks(uint32_t us, uint64_t tscHz);
 struct IdleTotals {
     uint64_t deepTicks, shallowTicks;
     uint64_t deepEntries, shallowEntries;
+    uint64_t allDeepTicks, allDeepEvents;   // every CPU in CC6 at once (package-C6 window)
+    uint64_t latencyVetoes;                 // deep predicted but a latency request forbade CC6
 };
 // sum(ticks) * 1000 / (ncpu * intervalTicks), capped at 1000; 0 if the interval is empty.
 uint32_t residencyPermille(uint64_t ticks, uint32_t ncpu, uint64_t intervalTicks);
 // delta * 1e9 / intervalNs (0 if intervalNs == 0).
 uint64_t ratePerSecond(uint64_t delta, uint64_t intervalNs);
+
+// ------------------------------------------------------------------ governor sampling
+// Idle time of one CPU accounted up to TSC `now`: the closed idle periods plus the
+// open one (entered at `since`) while the CPU is still inside the hook.
+static inline uint64_t idleAccumulated(uint64_t closedTicks, bool inIdle, uint64_t since, uint64_t now) {
+    return closedTicks + ((inIdle && now > since) ? now - since : 0);
+}
+// Busy share of a window from two idle accumulations: 1000 - idle * 1000 / window,
+// with the idle delta clamped to [0, window]. 1000 if the window is empty.
+uint32_t idleWindowBusyPermille(uint64_t prevAcc, uint64_t curAcc, uint64_t windowTicks);
 
 } // namespace zen
 

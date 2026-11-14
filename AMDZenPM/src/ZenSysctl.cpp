@@ -179,6 +179,18 @@ int sysctlIdle SYSCTL_HANDLER_ARGS {
     return ioReturnToErrno(r);
 }
 
+// kern.amdzen.fast_up_pct / gov_idle_sampling: software knobs outside the tunables ABI.
+int sysctlGovKnob SYSCTL_HANDLER_ARGS {
+    PmRef ref;
+    AMDZenPM *pm = ref.pm;
+    if (!pm) return ENXIO;
+    int nv = (int)pm->getGovKnob((uint32_t)arg2);
+    int err = sysctl_handle_int(oidp, &nv, 0, req);
+    if (err || !req->newptr) return err;
+    if (nv < 0) return EINVAL;
+    return ioReturnToErrno(pm->setGovKnob((uint32_t)arg2, (uint32_t)nv));
+}
+
 int sysctlInt SYSCTL_HANDLER_ARGS {
     PmRef ref;
     AMDZenPM *pm = ref.pm;
@@ -276,6 +288,8 @@ ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, limit_fast,     RW_INT, nullptr, kIntLimitFa
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, limit_slow,     RW_INT, nullptr, kIntLimitSlow,    sysctlInt,         "I", "Legacy: slowest allowed P-state index; CPPC: max perf (0 = default)");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, user_pstate,    RW_INT, nullptr, kIntUser,         sysctlInt,         "I", "userspace governor: P-state index (legacy) or desired perf (CPPC)");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, period_ms,      RW_INT, nullptr, kIntPeriod,       sysctlInt,         "I", "Governor period (ms, 4..1000)");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, fast_up_pct,    RW_INT, nullptr, AMDZenPM::kKnobFastUpPct, sysctlGovKnob, "I", "schedutil: busy % that jumps straight to the fastest P-state (0 = off)");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, gov_idle_sampling, RW_INT, nullptr, AMDZenPM::kKnobGovIdleSampling, sysctlGovKnob, "I", "1: legacy governor samples load from the idle hook (no IPI); 0: APERF/MPERF rendezvous every tick");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, idle_mode,      RW_INT, nullptr, kIntIdleMode,     sysctlIdle,        "I", "Idle hook: 0 off(HLT) 1 HLT 2 MWAIT 3 CC6 (clamped to hardware); -1 = not registered");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, idle_threshold_us, RW_INT, nullptr, kIntIdleThreshold, sysctlIdle,     "I", "Predicted idle length (us) above which CC6 is used (0..1000000)");
 
@@ -284,7 +298,7 @@ static struct sysctl_oid *const kZenOids[] = {
     &ZEN_OID(freq_avg_mhz), &ZEN_OID(freq_max_mhz), &ZEN_OID(vcore_mv), &ZEN_OID(busy_permille),
     &ZEN_OID(backend), &ZEN_OID(block_reason), &ZEN_OID(governor), &ZEN_OID(boost), &ZEN_OID(epp),
     &ZEN_OID(limit_fast), &ZEN_OID(limit_slow), &ZEN_OID(user_pstate), &ZEN_OID(period_ms),
-    &ZEN_OID(idle_mode), &ZEN_OID(idle_threshold_us),
+    &ZEN_OID(idle_mode), &ZEN_OID(idle_threshold_us), &ZEN_OID(fast_up_pct), &ZEN_OID(gov_idle_sampling),
 };
 
 void AMDZenPM::registerSysctls() {

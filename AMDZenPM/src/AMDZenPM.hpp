@@ -37,6 +37,7 @@
 #include "AMDZenShared.h"
 #include "ZenModel.hpp"
 #include "ZenHW.hpp"
+#include "ZenIdle.hpp"
 
 class AMDZenPM : public IOService {
     OSDeclareDefaultStructors(AMDZenPM)
@@ -67,6 +68,11 @@ public:
     IOReturn setIdleThresholdUs(uint32_t us);
     // mode = -1 when the hook is not registered.
     void     getIdleConfig(int32_t *mode, uint32_t *thresholdUs);
+    // Governor knobs outside the AMDZenTunables ABI (kern.amdzen.fast_up_pct,
+    // kern.amdzen.gov_idle_sampling). Reads are lock-free.
+    enum GovKnob : uint32_t { kKnobFastUpPct = 0, kKnobGovIdleSampling = 1 };
+    IOReturn setGovKnob(uint32_t which, uint32_t value);
+    uint32_t getGovKnob(uint32_t which);
 
     // The single started instance, retained (caller must release()), or null.
     // Taken under the lock stop() uses to clear it, so a caller can never hold a
@@ -87,6 +93,9 @@ private:
     void     restoreHardware();           // on stop/sleep: P0 / initial CPPC REQ / boot HWCR
     void     timerFired(IOTimerEventSource *src);
     void     governorTick(uint64_t nowNs);
+    int      governorTickIdle();          // 1 decided, 0 primed, -1 unusable (see .cpp)
+    void     governLegacyCores(const zen::PStateTable &t, const uint16_t *coreUtil,
+                               const uint16_t *coreBusy);
     void     telemetryTick(uint64_t nowNs);
     void     publishProperties();
     void     buildPStateTable(zen::PStateTable *t);
@@ -149,6 +158,19 @@ private:
     uint64_t lastGovNs {0};
     uint64_t seq {0};
 
+    // ---- governor sampling (timerFired). With the idle hook active the legacy
+    // governor runs on the hook's per-CPU idle accounting and needs no IPI unless a
+    // request changes; otherwise it samples APERF/MPERF on every CPU each tick.
+    zen::idle::CpuIdleSnap *idleSnapPrev {nullptr}, *idleSnapCur {nullptr};
+    uint64_t idleSnapTsc {0};
+    bool     idleSnapValid {false};
+    uint32_t govIdleSampling {1};         // GovIdleSampling / amdzen.govidle (atomic)
+    bool     govFromIdle {false};         // the last tick decided from idle accounting
+    bool     perfFresh {false};           // rawPrev holds the previous tick's sample
+    bool     reqDirty {false};            // a governor request is not written yet
+    uint64_t rendezvousCount {0}, rendezvousPrev {0}, rendezvousPrevNs {0};
+    uint64_t rendezvousRate {0};          // CPU-wide IPI rounds per second
+
     // ---- CC6 idle hook (ZenIdle.cpp owns the dispatch table and per-CPU state)
     uint32_t idleRequest {zen::kIdleAuto};          // boot-arg / personality
     uint32_t idleThresholdUs {zen::kIdleThresholdDefaultUs};
@@ -168,6 +190,10 @@ private:
     bool     idlePrevValid {false};
     uint32_t idleCc6Permille {0}, idleC1Permille {0};
     uint64_t idleDeepRate {0}, idleShallowRate {0};
+    uint32_t idleAllDeepPermille {0};     // every CPU in CC6 at once
+    uint64_t idleAllDeepRate {0}, idleVetoRate {0};
+    uint64_t pmgtMisc {0};                // C001_0292 (PC6En = bit 32)
+    bool     havePmgtMisc {false};
 };
 
 class AMDZenPMUserClient : public IOUserClient {

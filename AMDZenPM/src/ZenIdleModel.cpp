@@ -273,4 +273,19 @@ uint64_t ratePerSecond(uint64_t delta, uint64_t intervalNs) {
     return s ? delta / s : UINT64_MAX;
 }
 
+uint32_t idleDeepLatencyUs(const CstEntry *cst, uint32_t n, int32_t cstIndex) {
+    if (cst && cstIndex >= 0 && (uint32_t)cstIndex < n && cst[cstIndex].latencyUs != 0)
+        return cst[cstIndex].latencyUs;
+    return kIdleDeepLatencyDefaultUs;
+}
+
+uint32_t idleWindowBusyPermille(uint64_t prevAcc, uint64_t curAcc, uint64_t windowTicks) {
+    if (windowTicks == 0) return 1000;
+    uint64_t idle = curAcc > prevAcc ? curAcc - prevAcc : 0;
+    if (idle >= windowTicks) return 0;
+    const uint64_t busy = windowTicks - idle;
+    if (busy <= UINT64_MAX / 1000ull) return (uint32_t)(busy * 1000ull / windowTicks);
+    return (uint32_t)(busy / (windowTicks / 1000ull));        // windowTicks > 2^54 here
+}
+
 } // namespace zen

@@ -107,7 +107,9 @@ struct alignas(64) CpuState {
     uint64_t shallowEntries;
     uint64_t deepTicks;
     uint64_t shallowTicks;
-    uint64_t pad[3];
+    uint64_t since;          // TSC at entry of the open idle period (valid while gen is odd)
+    uint64_t gen;            // seqcount: odd inside the hook, even outside
+    uint64_t pad[1];
 };
 static_assert(sizeof(CpuState) == 64, "one cache line per CPU");
 
@@ -126,12 +128,29 @@ MonitorLine      gMonitor[AMDZEN_MAX_CPUS];
 
 bool     gClaimed;          // registration attempted (atomic exchange: once per boot)
 bool     gRegistered;       // pmKextRegister returned
+bool     gInitDone;         // initComplete ran: the kernel calls MachineIdle
 uint32_t gMode;             // IdleMode in effect (read every idle)
 uint32_t gMaxMode;
 uint32_t gPort;             // CStateAddr + k (only read when gMode == kIdleCc6)
 uint32_t gMwait;            // 1 = MONITOR/MWAIT usable
 uint64_t gThreshold;        // TSC ticks
 uint64_t gClamp;            // predictor sample clamp (TSC ticks)
+uint32_t gNcpu;             // CPUs that must be deep for the all-cores-deep window
+uint64_t gDeepLatencyNs;    // CC6 exit latency (ns)
+uint64_t gMaxIntDelay;      // latest ml_set_maxintdelay (ns, 0 = none)
+uint64_t gMaxBusDelay;      // latest ml_set_maxbusdelay (ns, 0 = none)
+
+// All-cores-deep window. Shared by every CPU: touched only on CC6 entry/exit
+// (two atomic RMWs), never on the C1 path. Separate line from the per-CPU state.
+struct alignas(64) AllDeep {
+    uint32_t count;          // CPUs currently inside ioIdle()
+    uint32_t pad0;
+    uint64_t start;          // TSC when count reached gNcpu
+    uint64_t ticks;
+    uint64_t events;
+    uint64_t vetoes;         // latency requests that kept a CPU out of CC6
+};
+AllDeep gAll;
 
 // ---------------------------------------------------------------- idle entry
 // All three primitives are entered and left with IF=0.
@@ -178,10 +197,32 @@ uint64_t machineIdle(uint64_t maxIdleDuration) {
     bool deep = false;
 
     const uint64_t t0 = zen_rdtsc();
-    if (mode == kIdleCc6 && idlePredictDeep(ewma, thr)) {
+    // Open the idle period for the governor's lock-free reader (snapshot()).
+    const uint64_t gen = st->gen;
+    __atomic_store_n(&st->since, t0, __ATOMIC_RELAXED);
+    __atomic_store_n(&st->gen, gen + 1, __ATOMIC_RELEASE);
+    bool wantDeep = mode == kIdleCc6 && idlePredictDeep(ewma, thr);
+    if (wantDeep && !idleLatencyAllowsDeep(__atomic_load_n(&gMaxIntDelay, __ATOMIC_RELAXED),
+                                           __atomic_load_n(&gMaxBusDelay, __ATOMIC_RELAXED),
+                                           __atomic_load_n(&gDeepLatencyNs, __ATOMIC_RELAXED))) {
+        wantDeep = false;
+        __atomic_fetch_add(&gAll.vetoes, 1, __ATOMIC_RELAXED);
+    }
+    if (wantDeep) {
         const uint32_t port = __atomic_load_n(&gPort, __ATOMIC_RELAXED);
         if (port) {
+            const uint32_t n = __atomic_load_n(&gNcpu, __ATOMIC_RELAXED);
+            if (__atomic_add_fetch(&gAll.count, 1, __ATOMIC_ACQ_REL) == n)
+                __atomic_store_n(&gAll.start, zen_rdtsc(), __ATOMIC_RELAXED);
             ioIdle((uint16_t)port);
+            const uint64_t t1 = zen_rdtsc();
+            if (__atomic_fetch_sub(&gAll.count, 1, __ATOMIC_ACQ_REL) == n) {
+                const uint64_t span = idleAllDeepSpan(t0, __atomic_load_n(&gAll.start, __ATOMIC_RELAXED), t1);
+                if (span) {
+                    __atomic_fetch_add(&gAll.ticks, span, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&gAll.events, 1, __ATOMIC_RELAXED);
+                }
+            }
             deep = true;
         } else {
             haltIdle();
@@ -204,10 +245,20 @@ uint64_t machineIdle(uint64_t maxIdleDuration) {
         __atomic_store_n(&st->shallowEntries, st->shallowEntries + 1, __ATOMIC_RELAXED);
         __atomic_store_n(&st->shallowTicks, st->shallowTicks + dt, __ATOMIC_RELAXED);
     }
+    __atomic_store_n(&st->gen, gen + 2, __ATOMIC_RELEASE);   // period closed (after the ticks)
     return 0;
 }
 
+// Latency requests. Not gated by pmInitDone in the kernel: live from pmKextRegister
+// on. Store-only (the idle path reads them); getters return the stored values.
+void setMaxIntDelay(uint64_t ns) { __atomic_store_n(&gMaxIntDelay, ns, __ATOMIC_RELAXED); }
+uint64_t getMaxIntDelay() { return __atomic_load_n(&gMaxIntDelay, __ATOMIC_RELAXED); }
+void setMaxBusDelay(uint64_t ns) { __atomic_store_n(&gMaxBusDelay, ns, __ATOMIC_RELAXED); }
+uint64_t getMaxBusDelay() { return __atomic_load_n(&gMaxBusDelay, __ATOMIC_RELAXED); }
+
 void publishConfig(const HookConfig &cfg) {
+    __atomic_store_n(&gNcpu, cfg.ncpu ? cfg.ncpu : 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&gDeepLatencyNs, cfg.deepLatencyNs, __ATOMIC_RELAXED);
     __atomic_store_n(&gPort, (uint32_t)cfg.port, __ATOMIC_RELAXED);
     __atomic_store_n(&gMwait, cfg.mwait ? 1u : 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&gMaxMode, cfg.maxMode, __ATOMIC_RELAXED);
@@ -226,11 +277,16 @@ bool registerHook(const HookConfig &cfg) {
     if (__atomic_exchange_n(&gClaimed, true, __ATOMIC_SEQ_CST)) return false;
 
     publishConfig(cfg);
-    // Table completely filled before the kernel can see it. Only MachineIdle is
-    // set; gTable is zero BSS so every other slot is NULL.
+    // Table completely filled before the kernel can see it. Only MachineIdle and
+    // the store-only latency get/set slots are set (xnu-pm.md §4, §9); every other
+    // slot stays NULL.
     bzero(&gTable, sizeof(gTable));
     bzero(&gCallbacks, sizeof(gCallbacks));
     gTable.MachineIdle = &machineIdle;
+    gTable.setMaxIntDelay = &setMaxIntDelay;
+    gTable.getMaxIntDelay = &getMaxIntDelay;
+    gTable.setMaxBusDelay = &setMaxBusDelay;
+    gTable.getMaxBusDelay = &getMaxBusDelay;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
     // The kernel is about to point into our text and data: pin the kext first so
@@ -248,8 +304,10 @@ bool registerHook(const HookConfig &cfg) {
 
     // The kernel never calls initComplete itself; until it runs, pmInitDone = 0
     // and machine_idle() keeps its own HLT path.
-    if (gCallbacks.cb.initComplete) gCallbacks.cb.initComplete();
-    else ILOG("idle: kernel returned no initComplete callback; hook stays inactive");
+    if (gCallbacks.cb.initComplete) {
+        gCallbacks.cb.initComplete();
+        __atomic_store_n(&gInitDone, true, __ATOMIC_RELEASE);
+    } else ILOG("idle: kernel returned no initComplete callback; hook stays inactive");
     return true;
 }
 
@@ -293,6 +351,47 @@ void setThresholdTicks(uint64_t t) {
     __atomic_store_n(&gThreshold, t, __ATOMIC_RELAXED);
 }
 
+void latencyRequests(uint64_t *maxIntDelayNs, uint64_t *maxBusDelayNs) {
+    if (maxIntDelayNs) *maxIntDelayNs = __atomic_load_n(&gMaxIntDelay, __ATOMIC_RELAXED);
+    if (maxBusDelayNs) *maxBusDelayNs = __atomic_load_n(&gMaxBusDelay, __ATOMIC_RELAXED);
+}
+
+bool active() {
+    return registered() && __atomic_load_n(&gInitDone, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&gTable.MachineIdle, __ATOMIC_ACQUIRE) != nullptr;
+}
+
+void snapshot(CpuIdleSnap *out, uint32_t ncpu, uint64_t now) {
+    if (!out) return;
+    if (ncpu > AMDZEN_MAX_CPUS) ncpu = AMDZEN_MAX_CPUS;
+    for (uint32_t i = 0; i < ncpu; i++) {
+        const CpuState &s = gCpu[i];
+        uint64_t acc = 0, entries = 0;
+        bool ok = false;
+        // Seqlock read: retry while the CPU entered or left idle under us.
+        for (int tries = 0; tries < 8 && !ok; tries++) {
+            const uint64_t g1 = __atomic_load_n(&s.gen, __ATOMIC_ACQUIRE);
+            const uint64_t since = __atomic_load_n(&s.since, __ATOMIC_RELAXED);
+            const uint64_t closed = __atomic_load_n(&s.deepTicks, __ATOMIC_RELAXED) +
+                                    __atomic_load_n(&s.shallowTicks, __ATOMIC_RELAXED);
+            entries = __atomic_load_n(&s.deepEntries, __ATOMIC_RELAXED) +
+                      __atomic_load_n(&s.shallowEntries, __ATOMIC_RELAXED);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            const uint64_t g2 = __atomic_load_n(&s.gen, __ATOMIC_RELAXED);
+            if (g1 != g2) continue;
+            acc = idleAccumulated(closed, (g1 & 1) != 0, since, now);
+            ok = true;
+        }
+        if (!ok) {
+            // Still racing after 8 tries: count only the closed periods (errs busy).
+            acc = __atomic_load_n(&s.deepTicks, __ATOMIC_RELAXED) +
+                  __atomic_load_n(&s.shallowTicks, __ATOMIC_RELAXED);
+        }
+        out[i].idleAcc = acc;
+        out[i].entries = entries;
+    }
+}
+
 void totals(IdleTotals *out, uint32_t ncpu) {
     if (!out) return;
     bzero(out, sizeof(*out));
@@ -304,6 +403,9 @@ void totals(IdleTotals *out, uint32_t ncpu) {
         out->deepEntries    += __atomic_load_n(&s.deepEntries, __ATOMIC_RELAXED);
         out->shallowEntries += __atomic_load_n(&s.shallowEntries, __ATOMIC_RELAXED);
     }
+    out->allDeepTicks = __atomic_load_n(&gAll.ticks, __ATOMIC_RELAXED);
+    out->allDeepEvents = __atomic_load_n(&gAll.events, __ATOMIC_RELAXED);
+    out->latencyVetoes = __atomic_load_n(&gAll.vetoes, __ATOMIC_RELAXED);
 }
 
 // ---------------------------------------------------------------- ACPI _CST

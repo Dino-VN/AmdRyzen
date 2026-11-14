@@ -29,6 +29,7 @@
 #define MSR_PSTATE_STATUS            0xC0010063u  // [2:0] CurPstate
 #define MSR_PSTATE_DEF_BASE          0xC0010064u  // +0..7
 #define MSR_CSTATE_BASE_ADDR         0xC0010073u  // [15:0] CstateAddr; IO reads of base..base+7 trap to C-states
+#define MSR_PMGT_MISC                0xC0010292u  // [32] PC6En (CoreFreq, ZenStates); package scope, read-only use
 #define MSR_CSTATE_POLICY            0xC0010294u  // undocumented in PPR (CoreFreq layout); informational
 #define MSR_CSTATE_CONFIG            0xC0010296u  // CCR0/1/2: CC6EN at bits 6/14/22 (CoreFreq, ZenStates)
 #define MSR_HW_PSTATE_STATUS         0xC0010293u  // [7:0] FID [13:8] DFS [21:14] VID [24:22] HwPstate (17h/19h)

@@ -53,6 +53,7 @@ enum GateOp : uint32_t {
     kGateStop,
     kGateSetIdleMode,      // a1 = IdleMode
     kGateSetIdleThreshold, // a1 = microseconds
+    kGateSetGovKnob,       // a1 = GovKnob, a2 = value
 };
 
 const char *const kConflictClasses[] = {
@@ -281,6 +282,8 @@ void AMDZenPM::free() {
     ZFREE(rawPrev, zen::PerCpuRaw, AMDZEN_MAX_CPUS);
     ZFREE(rawCur, zen::PerCpuRaw, AMDZEN_MAX_CPUS);
     ZFREE(rawTelemPrev, zen::PerCpuRaw, AMDZEN_MAX_CPUS);
+    ZFREE(idleSnapPrev, zen::idle::CpuIdleSnap, AMDZEN_MAX_CPUS);
+    ZFREE(idleSnapCur, zen::idle::CpuIdleSnap, AMDZEN_MAX_CPUS);
     ZFREE(govState, zen::GovState, AMDZEN_MAX_CORES);
     ZFREE(coreEnergy, zen::EnergyAccumulator, AMDZEN_MAX_CORES);
     ZFREE(pstateReq, uint8_t, AMDZEN_MAX_CPUS);
@@ -344,6 +347,9 @@ void AMDZenPM::loadConfig() {
     if (readU32(getProperty("FreqStepPct"), &v))        tun.freqStepPct = minU(v, 100);
     if (readU32(getProperty("UtilHeadroomPct"), &v))    tun.utilHeadroomPct = clampU(v, 100, 200);
     if (readU32(getProperty("UtilEwmaShift"), &v))      tun.utilEwmaShift = minU(v, 8);
+    if (readU32(getProperty("FastUpPct"), &v))          tun.fastUpPct = minU(v, 100);
+    if (readU32(getProperty("GovIdleSampling"), &v))    govIdleSampling = v ? 1 : 0;
+    else if (OSBoolean *b = OSDynamicCast(OSBoolean, getProperty("GovIdleSampling"))) govIdleSampling = b->isTrue() ? 1 : 0;
     if (tun.downThreshold >= tun.upThreshold) tun.downThreshold = tun.upThreshold ? tun.upThreshold - 1 : 0;
     if (readU32(getProperty("TjMax"), &v) && v >= 50 && v <= 150) tjMax_mC = v * 1000;
     int32_t lim;
@@ -379,6 +385,10 @@ void AMDZenPM::loadConfig() {
     if (PE_parse_boot_argn("amdzen.boost", &iv, sizeof(iv))) boostMode = iv ? 1 : 0;
     if (PE_parse_boot_argn("amdzen.epp", &iv, sizeof(iv)) && iv >= 0 && iv <= 255) epp = (uint32_t)iv;
     if (PE_parse_boot_argn("amdzen.period", &iv, sizeof(iv)) && iv > 0) governorPeriodMs = clampU((uint32_t)iv, 4, 1000);
+    iv = -1;
+    if (PE_parse_boot_argn("amdzen.fastup", &iv, sizeof(iv)) && iv >= 0) tun.fastUpPct = minU((uint32_t)iv, 100);
+    iv = -1;
+    if (PE_parse_boot_argn("amdzen.govidle", &iv, sizeof(iv)) && iv >= 0) govIdleSampling = iv ? 1 : 0;
     iv = 0;
     if (PE_parse_boot_argn("amdzen.force", &iv, sizeof(iv)) && iv) forceControl = true;
     iv = 0;
@@ -476,12 +486,14 @@ bool AMDZenPM::start(IOService *provider) {
     rawPrev      = ZALLOC(zen::PerCpuRaw, AMDZEN_MAX_CPUS);
     rawCur       = ZALLOC(zen::PerCpuRaw, AMDZEN_MAX_CPUS);
     rawTelemPrev = ZALLOC(zen::PerCpuRaw, AMDZEN_MAX_CPUS);
+    idleSnapPrev = ZALLOC(zen::idle::CpuIdleSnap, AMDZEN_MAX_CPUS);
+    idleSnapCur  = ZALLOC(zen::idle::CpuIdleSnap, AMDZEN_MAX_CPUS);
     govState     = ZALLOC(zen::GovState, AMDZEN_MAX_CORES);
     coreEnergy   = ZALLOC(zen::EnergyAccumulator, AMDZEN_MAX_CORES);
     pstateReq    = ZALLOC(uint8_t, AMDZEN_MAX_CPUS);
     cppcReq      = ZALLOC(uint64_t, AMDZEN_MAX_CPUS);
     if (!info || !sample || !rawPrev || !rawCur || !rawTelemPrev || !govState || !coreEnergy ||
-        !pstateReq || !cppcReq)
+        !pstateReq || !cppcReq || !idleSnapPrev || !idleSnapCur)
         return bail("out of memory");
 
     // ---- work loop, gate, timer. Hardware discovery is deferred to the work loop:
@@ -645,6 +657,7 @@ bool AMDZenPM::tryInitHardware() {
         cppcReq[c] = cpu.cppcReqInitial(c);
     }
     rebaseEnergy = true;
+    perfFresh = true;
     lastTelemetryNs = 0;
     initialized = true;
 
@@ -828,27 +841,67 @@ void AMDZenPM::timerFired(IOTimerEventSource *src) {
 
     bool doTel = prime || !dyn || lastTelemetryNs == 0 || (now - lastTelemetryNs) + halfGovNs >= telNs;
 
-    uint32_t ops = zen::kOpSamplePerf | (doTel ? zen::kOpSampleSlow : 0);
+    uint32_t writeOp = 0;
     if (control) {
-        // Apply the request decided on the previous tick (one IPI round per tick).
-        if (backend == kAMDZenBackendLegacy) {
-            ops |= zen::kOpWritePState;
+        if (backend == kAMDZenBackendLegacy) writeOp = zen::kOpWritePState;
+        else if (backend == kAMDZenBackendCppcMsr && gCppcEnabled) writeOp = zen::kOpWriteCppcReq;
+    }
+
+    // Legacy governor from the idle hook's accounting (no IPI). Falls back to the
+    // APERF/MPERF rendezvous below while priming, when nothing idled through the
+    // hook in the window (all CPUs busy, or the kernel is not calling it), or when
+    // disabled (GovIdleSampling = 0).
+    bool idleGov = false;
+    if (dyn && !prime && writeOp == zen::kOpWritePState &&
+        __atomic_load_n(&govIdleSampling, __ATOMIC_RELAXED) && zen::idle::active())
+        idleGov = governorTickIdle() > 0;
+    else
+        idleSnapValid = false;          // re-prime when this path is taken again
+
+    // Sample every CPU on telemetry ticks and whenever the APERF/MPERF governor
+    // runs. Requests are re-applied on every sampling round (writes of unchanged
+    // values are skipped per CPU); between samples only a changed request costs
+    // an IPI round.
+    const bool needPerf = doTel || !idleGov;
+    uint32_t ops = needPerf ? (zen::kOpSamplePerf | (doTel ? zen::kOpSampleSlow : 0)) : 0;
+    if (writeOp && (needPerf || reqDirty)) ops |= writeOp;
+    if (ops) {
+        cpu.run(ops, needPerf ? rawCur : nullptr, pstateReq, cppcReq);
+        rendezvousCount++;
+        if (ops & writeOp) {
             gControlTouched = true;
-        } else if (backend == kAMDZenBackendCppcMsr && gCppcEnabled) {
-            ops |= zen::kOpWriteCppcReq;
-            gControlTouched = true;
+            reqDirty = false;
         }
     }
-    cpu.run(ops, rawCur, pstateReq, cppcReq);
 
-    if (dyn && !prime) governorTick(now);
-    if (doTel) telemetryTick(now);
+    if (dyn && !prime && !idleGov && perfFresh) {
+        governorTick(now);
+        // Apply the decision now rather than on the next tick: a second round, but
+        // only when a request actually changed.
+        if (reqDirty && writeOp) {
+            cpu.run(writeOp, nullptr, pstateReq, cppcReq);
+            rendezvousCount++;
+            gControlTouched = true;
+            reqDirty = false;
+        }
+    }
+    govFromIdle = idleGov;
+    if (doTel) {
+        if (rendezvousPrevNs && now > rendezvousPrevNs)
+            rendezvousRate = zen::ratePerSecond(rendezvousCount - rendezvousPrev, now - rendezvousPrevNs);
+        rendezvousPrev = rendezvousCount;
+        rendezvousPrevNs = now;
+        telemetryTick(now);
+    }
     rebaseEnergy = false;
     lastGovNs = now;
 
-    zen::PerCpuRaw *t = rawPrev;
-    rawPrev = rawCur;
-    rawCur = t;
+    if (needPerf) {
+        zen::PerCpuRaw *t = rawPrev;
+        rawPrev = rawCur;
+        rawCur = t;
+    }
+    perfFresh = needPerf;
 
     src->setTimeoutMS(dyn ? governorPeriodMs : telemetryPeriodMs);
 }
@@ -896,16 +949,7 @@ void AMDZenPM::governorTick(uint64_t nowNs) {
     if (backend == kAMDZenBackendLegacy) {
         zen::PStateTable t;
         buildPStateTable(&t);
-        for (uint32_t k = 0; k < ncores; k++) {
-            uint32_t idx = zen::governLegacy(governor, tun, t, &govState[k], coreUtil[k], coreBusy[k], userValue);
-            // Never request a disabled / undecodable definition (fall back towards P0).
-            idx = enabledAtOrFaster(info, minU(idx, AMDZEN_MAX_PSTATES - 1));
-            coreUtil[k] = (uint16_t)idx;   // reuse as result
-        }
-        for (uint32_t c = 0; c < ncpu; c++) {
-            uint32_t core = tp.coreOfCpu[c];
-            if (core < ncores) pstateReq[c] = (uint8_t)coreUtil[core];
-        }
+        governLegacyCores(t, coreUtil, coreBusy);
     } else if (backend == kAMDZenBackendCppcMsr && gCppcEnabled) {
         for (uint32_t k = 0; k < ncores; k++) {
             uint32_t des = zen::governCppcDesired(governor, tun, pol.minPerf, pol.maxPerf, &govState[k],
@@ -914,11 +958,85 @@ void AMDZenPM::governorTick(uint64_t nowNs) {
         }
         for (uint32_t c = 0; c < ncpu; c++) {
             uint32_t core = tp.coreOfCpu[c];
-            if (core < ncores)
-                cppcReq[c] = zen::encodeCppcReq(cpu.cppcReqInitial(c), pol.maxPerf, pol.minPerf,
-                                                coreUtil[core], 0);
+            if (core >= ncores) continue;
+            const uint64_t req = zen::encodeCppcReq(cpu.cppcReqInitial(c), pol.maxPerf, pol.minPerf,
+                                                    coreUtil[core], 0);
+            if (req != cppcReq[c]) reqDirty = true;
+            cppcReq[c] = req;
         }
     }
+}
+
+void AMDZenPM::governLegacyCores(const zen::PStateTable &t, const uint16_t *coreUtil,
+                                 const uint16_t *coreBusy) {
+    const zen::Topology &tp = cpu.topo();
+    const uint32_t ncpu = minU(tp.ncpu, AMDZEN_MAX_CPUS);
+    const uint32_t ncores = minU(tp.ncores, AMDZEN_MAX_CORES);
+    uint8_t idxOfCore[AMDZEN_MAX_CORES];
+    for (uint32_t k = 0; k < ncores; k++) {
+        uint32_t idx = zen::governLegacy(governor, tun, t, &govState[k], coreUtil[k], coreBusy[k], userValue);
+        // Never request a disabled / undecodable definition (fall back towards P0).
+        idxOfCore[k] = (uint8_t)enabledAtOrFaster(info, minU(idx, AMDZEN_MAX_PSTATES - 1));
+    }
+    for (uint32_t c = 0; c < ncpu; c++) {
+        uint32_t core = tp.coreOfCpu[c];
+        if (core >= ncores) continue;
+        if (pstateReq[c] != idxOfCore[core]) reqDirty = true;
+        pstateReq[c] = idxOfCore[core];
+    }
+}
+
+// Legacy governor input from the idle hook instead of an APERF/MPERF rendezvous:
+// busy = 1 - (idle time in the window) / window for every CPU, read lock-free from
+// the hook's per-CPU accounting, and util = busy scaled by the P-state each core
+// was asked to run at. Returns 1 when requests were decided, 0 when it only primed
+// its snapshot, -1 when the window has no idle exits at all (every CPU busy for
+// the whole window, or the kernel is not calling the hook): the caller then uses
+// the APERF/MPERF path, which is exact in both cases.
+int AMDZenPM::governorTickIdle() {
+    const zen::Topology &tp = cpu.topo();
+    const uint32_t ncpu = minU(tp.ncpu, AMDZEN_MAX_CPUS);
+    const uint32_t ncores = minU(tp.ncores, AMDZEN_MAX_CORES);
+    if (!ncpu || !ncores) return -1;
+
+    const uint64_t nowTsc = zen_rdtsc();
+    zen::idle::snapshot(idleSnapCur, ncpu, nowTsc);
+    const bool valid = idleSnapValid && nowTsc > idleSnapTsc;
+    const uint64_t window = nowTsc - idleSnapTsc;
+    zen::idle::CpuIdleSnap *prev = idleSnapPrev;
+    const zen::idle::CpuIdleSnap *cur = idleSnapCur;
+    idleSnapPrev = idleSnapCur;
+    idleSnapCur = prev;
+    idleSnapTsc = nowTsc;
+    idleSnapValid = true;
+    if (!valid) return 0;
+
+    uint64_t exits = 0;
+    for (uint32_t c = 0; c < ncpu; c++) exits += cur[c].entries - prev[c].entries;
+    if (exits == 0) return -1;
+
+    const uint32_t refMHz = info->baseFreqMHz ? info->baseFreqMHz : info->pstates[0].freqMHz;
+    if (!refMHz) return -1;
+
+    uint16_t coreUtil[AMDZEN_MAX_CORES];
+    uint16_t coreBusy[AMDZEN_MAX_CORES];
+    memset(coreUtil, 0, sizeof(coreUtil));
+    memset(coreBusy, 0, sizeof(coreBusy));
+    for (uint32_t c = 0; c < ncpu; c++) {
+        uint32_t core = tp.coreOfCpu[c];
+        if (core >= ncores) continue;
+        uint32_t b = zen::idleWindowBusyPermille(prev[c].idleAcc, cur[c].idleAcc, window);
+        if (b > coreBusy[core]) coreBusy[core] = (uint16_t)b;
+    }
+    for (uint32_t k = 0; k < ncores; k++) {
+        uint32_t idx = minU(pstateReq[tp.primaryCpuOfCore[k]], AMDZEN_MAX_PSTATES - 1);
+        uint32_t f = info->pstates[idx].freqMHz ? info->pstates[idx].freqMHz : refMHz;
+        coreUtil[k] = (uint16_t)zen::utilFromBusy(coreBusy[k], f, refMHz);
+    }
+    zen::PStateTable t;
+    buildPStateTable(&t);
+    governLegacyCores(t, coreUtil, coreBusy);
+    return 1;
 }
 
 void AMDZenPM::telemetryTick(uint64_t nowNs) {
@@ -1266,6 +1384,8 @@ void AMDZenPM::publishProperties() {
     dictNum(d, "LimitFast", s->limitFast);
     dictNum(d, "LimitSlow", s->limitSlow);
     if (backend == kAMDZenBackendCppcMsr) dictNum(d, "EPP", s->epp);
+    dictStr(d, "GovSource", govFromIdle ? "idle" : "aperf");
+    dictNum(d, "GovRendezvousPerSec", rendezvousRate, 64);
     publishIdleSensors(d);
     setProperty("Sensors", d);
     d->release();
@@ -1355,6 +1475,8 @@ void AMDZenPM::setupIdle() {
     // ---- capability probe: read-only, done even when the hook stays off because
     // the values are the diagnostics for "why not" (published in CPUInfo).
     idleCaps = zen::IdleCaps {};
+    // C001_0292 PMGT_MISC is package scope: one careful read on this CPU (PC6En).
+    havePmgtMisc = zen_rdmsr_safe(MSR_PMGT_MISC, &pmgtMisc) == 0;
     if (zen::IdleMsrSample *ms = ZALLOC(zen::IdleMsrSample, AMDZEN_MAX_CPUS)) {
         const uint32_t n = cpu.readIdleMsrs(ms);
         idleCaps = zen::aggregateIdleMsrs(ms, n);
@@ -1421,6 +1543,8 @@ void AMDZenPM::setupIdle() {
     hc.port = in.cc6 ? (uint16_t)idlePort.port : 0;
     hc.mwait = idleMwait;
     hc.thresholdTicks = zen::usToTscTicks(idleThresholdUs, cpu.tscHz());
+    hc.ncpu = minU(cpu.topo().ncpu, AMDZEN_MAX_CPUS);
+    hc.deepLatencyNs = (uint64_t)zen::idleDeepLatencyUs(cst, cstCount, idlePort.cstIndex) * 1000ull;
 
     if (zen::idle::registered()) {
         // An earlier instance registered this boot (start/stop/start in the dev
@@ -1511,9 +1635,14 @@ void AMDZenPM::idleTelemetry(uint64_t nowNs) {
         idleC1Permille = zen::residencyPermille(t.shallowTicks - idlePrev.shallowTicks, ncpu, dTsc);
         idleDeepRate = zen::ratePerSecond(t.deepEntries - idlePrev.deepEntries, dNs);
         idleShallowRate = zen::ratePerSecond(t.shallowEntries - idlePrev.shallowEntries, dNs);
+        idleAllDeepPermille = zen::residencyPermille(t.allDeepTicks - idlePrev.allDeepTicks, 1, dTsc);
+        idleAllDeepRate = zen::ratePerSecond(t.allDeepEvents - idlePrev.allDeepEvents, dNs);
+        idleVetoRate = zen::ratePerSecond(t.latencyVetoes - idlePrev.latencyVetoes, dNs);
     } else {
         idleCc6Permille = idleC1Permille = 0;
         idleDeepRate = idleShallowRate = 0;
+        idleAllDeepPermille = 0;
+        idleAllDeepRate = idleVetoRate = 0;
     }
     idlePrev = t;
     idlePrevTsc = tsc;
@@ -1531,6 +1660,10 @@ void AMDZenPM::publishIdleInfo(OSDictionary *d) {
     dictNum(d, "CStateCfg", idleCaps.cfg, 64);
     dictNum(d, "CStatePolicy", idleCaps.policy, 64);
     dictBool(d, "CStateCfgUniform", idleCaps.cfgUniform);
+    if (havePmgtMisc) {
+        dictNum(d, "PmgtMisc", pmgtMisc, 64);
+        dictBool(d, "PC6Enabled", (pmgtMisc >> 32) & 1);
+    }
     dictStr(d, "IdleCC6", idleWakeLost ? "lost-after-wake" : zen::cc6ReasonName(idlePort.reason));
     dictNum(d, "IdlePort", idlePort.port);
     dictNum(d, "IdleCcr", idlePort.ccr);
@@ -1566,6 +1699,15 @@ void AMDZenPM::publishIdleSensors(OSDictionary *d) {
     dictNum(d, "C1Residency_permille", idleC1Permille);
     dictNum(d, "IdleEntriesDeep", idleDeepRate, 64);       // per second
     dictNum(d, "IdleEntriesShallow", idleShallowRate, 64); // per second
+    // Share of time every CPU sat in CC6 at once: the window in which the package
+    // can enter PC6. Near 0 with high CC6Residency means wake-ups are not aligned.
+    dictNum(d, "AllCoresCC6_permille", idleAllDeepPermille);
+    dictNum(d, "AllCoresCC6Entries", idleAllDeepRate, 64);   // per second
+    uint64_t latInt = 0, latBus = 0;
+    zen::idle::latencyRequests(&latInt, &latBus);
+    dictNum(d, "LatencyRequestInt_ns", latInt, 64);
+    dictNum(d, "LatencyRequestBus_ns", latBus, 64);
+    dictNum(d, "LatencyVetoes", idleVetoRate, 64);           // per second
 }
 
 // ===========================================================================
@@ -1676,6 +1818,21 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
         if (self->idleSleepDemoted) self->idleSavedMode = m;   // applied by idleWake()
         else zen::idle::setMode(m);
         LOG("idle mode -> %s", zen::idleModeName(m));
+        return kIOReturnSuccess;
+    }
+    case kGateSetGovKnob: {
+        // Software-only knobs: allowed in monitor-only mode too.
+        const uint32_t which = (uint32_t)(uintptr_t)a1, v = (uint32_t)(uintptr_t)a2;
+        if (which == kKnobFastUpPct) {
+            if (v > 100) return kIOReturnBadArgument;
+            __atomic_store_n(&self->tun.fastUpPct, v, __ATOMIC_RELAXED);
+        } else if (which == kKnobGovIdleSampling) {
+            if (v > 1) return kIOReturnBadArgument;
+            __atomic_store_n(&self->govIdleSampling, v, __ATOMIC_RELAXED);
+            self->idleSnapValid = false;
+        } else {
+            return kIOReturnBadArgument;
+        }
         return kIOReturnSuccess;
     }
     case kGateSetIdleThreshold: {
@@ -1892,6 +2049,16 @@ IOReturn AMDZenPM::setIdleThresholdUs(uint32_t us) {
     return runGated(kGateSetIdleThreshold, (void *)(uintptr_t)us);
 }
 
+IOReturn AMDZenPM::setGovKnob(uint32_t which, uint32_t value) {
+    return runGated(kGateSetGovKnob, (void *)(uintptr_t)which, (void *)(uintptr_t)value);
+}
+
+uint32_t AMDZenPM::getGovKnob(uint32_t which) {
+    if (which == kKnobFastUpPct) return __atomic_load_n(&tun.fastUpPct, __ATOMIC_RELAXED);
+    if (which == kKnobGovIdleSampling) return __atomic_load_n(&govIdleSampling, __ATOMIC_RELAXED);
+    return 0;
+}
+
 void AMDZenPM::getIdleConfig(int32_t *mode, uint32_t *thresholdUs) {
     if (mode) *mode = zen::idle::registered() ? (int32_t)zen::idle::mode() : -1;
     if (thresholdUs) *thresholdUs = __atomic_load_n(&idleThresholdUs, __ATOMIC_RELAXED);
@@ -1942,6 +2109,12 @@ IOReturn AMDZenPM::setProperties(OSObject *properties) {
     }
     if (OSObject *o = d->getObject("IdleThresholdUs"))
         note(readU32(o, &v) ? setIdleThresholdUs(v) : kIOReturnBadArgument);
+    if (OSObject *o = d->getObject("FastUpPct"))
+        note(readU32(o, &v) ? setGovKnob(kKnobFastUpPct, v) : kIOReturnBadArgument);
+    if (OSObject *o = d->getObject("GovIdleSampling")) {
+        if (OSBoolean *b = OSDynamicCast(OSBoolean, o)) note(setGovKnob(kKnobGovIdleSampling, b->isTrue() ? 1 : 0));
+        else note(readU32(o, &v) ? setGovKnob(kKnobGovIdleSampling, v) : kIOReturnBadArgument);
+    }
 
     OSObject *minO = d->getObject("MinPState"), *maxO = d->getObject("MaxPState");
     if (minO || maxO) {
