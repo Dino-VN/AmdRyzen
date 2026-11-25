@@ -21,9 +21,29 @@ $(BUILD)/test_idle: test_idle.cpp $(SRC)/ZenIdleModel.cpp $(SRC)/ZenIdleModel.hp
 	@mkdir -p $(BUILD)
 	$(HOSTCXX) $(CXXFLAGS) test_idle.cpp $(SRC)/ZenIdleModel.cpp -o $@
 
-test: $(BUILD)/test_model $(BUILD)/test_idle
+$(BUILD)/test_idle_sampling: test_idle_sampling.cpp $(SRC)/ZenIdleAccounting.hpp $(SRC)/ZenIdleModel.cpp $(SRC)/ZenIdleModel.hpp $(SRC)/ZenModel.cpp $(SRC)/ZenModel.hpp $(SRC)/AMDZenShared.h $(SRC)/ZenRegs.h
+	@mkdir -p $(BUILD)
+	$(HOSTCXX) $(CXXFLAGS) test_idle_sampling.cpp $(SRC)/ZenIdleModel.cpp $(SRC)/ZenModel.cpp -o $@
+
+$(BUILD)/test_pcc: test_pcc.cpp $(SRC)/ZenPccModel.cpp $(SRC)/ZenPccModel.hpp $(SRC)/ZenCppcTypes.hpp
+	@mkdir -p $(BUILD)
+	$(HOSTCXX) $(CXXFLAGS) -fno-exceptions -fno-rtti test_pcc.cpp $(SRC)/ZenPccModel.cpp -o $@
+
+$(BUILD)/test_native_policy: test_native_policy.cpp $(SRC)/ZenNativePolicy.cpp $(SRC)/ZenNativePolicy.hpp $(SRC)/ZenNativeSnapshot.hpp $(SRC)/ZenCppcTypes.hpp
+	@mkdir -p $(BUILD)
+	$(HOSTCXX) $(CXXFLAGS) test_native_policy.cpp $(SRC)/ZenNativePolicy.cpp -o $@
+
+$(BUILD)/test_native_integration: test_native_integration.cpp test_pcc.cpp $(wildcard native_stubs/*.hpp native_stubs/kern/*.h native_stubs/libkern/*.h) $(SRC)/AMDZenPMNative.cpp $(SRC)/AMDZenNativeControl.hpp $(SRC)/ZenNativePolicy.cpp $(SRC)/ZenPccModel.cpp $(SRC)/ZenIdleModel.cpp $(wildcard $(SRC)/*.hpp $(SRC)/*.h)
+	@mkdir -p $(BUILD)
+	$(HOSTCXX) $(CXXFLAGS) -Inative_stubs test_native_integration.cpp $(SRC)/ZenNativePolicy.cpp $(SRC)/ZenPccModel.cpp $(SRC)/ZenIdleModel.cpp -o $@
+
+test: $(BUILD)/test_model $(BUILD)/test_idle $(BUILD)/test_idle_sampling $(BUILD)/test_pcc $(BUILD)/test_native_policy $(BUILD)/test_native_integration
 	$(BUILD)/test_model
 	$(BUILD)/test_idle
+	$(BUILD)/test_idle_sampling
+	$(BUILD)/test_pcc
+	$(BUILD)/test_native_policy
+	$(BUILD)/test_native_integration
 
 # Kernel-flag compile of the model (same flags as build-probe/Makefile).
 SDK      ?= $(shell xcrun --sdk macosx --show-sdk-path)
@@ -32,14 +52,22 @@ KFW      := $(SDK)/System/Library/Frameworks/Kernel.framework
 KFLAGS   := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0 -mkernel -fno-builtin \
             -fno-common -nostdinc -I$(KFW)/PrivateHeaders -I$(KFW)/Headers \
             -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -O2 -Wall -Wextra \
-            -std=gnu++17 -fapple-kext -fno-exceptions -fno-rtti -fcheck-new
+            -std=gnu++17 -fapple-kext -fno-exceptions -fno-rtti -fcheck-new \
+            -Werror -Wno-unused-function -Wno-deprecated-declarations \
+            -Wno-inconsistent-missing-override -Wno-overloaded-virtual
 
-kcheck:
+KSOURCES := ZenModel ZenIdleModel ZenPccModel ZenPcc ZenNativePolicy ZenNativeSignals AMDZenPMNative ZenHW
+KOBJECTS := $(addprefix $(BUILD)/,$(addsuffix .kext.o,$(KSOURCES)))
+
+$(BUILD)/%.kext.o: $(SRC)/%.cpp $(wildcard $(SRC)/*.h $(SRC)/*.hpp)
 	@mkdir -p $(BUILD)
-	$(KCXX) $(KFLAGS) -c $(SRC)/ZenModel.cpp -o $(BUILD)/ZenModel.kext.o
-	$(KCXX) $(KFLAGS) -c $(SRC)/ZenIdleModel.cpp -o $(BUILD)/ZenIdleModel.kext.o
-	@echo "undefined symbols:"; nm -u $(BUILD)/ZenModel.kext.o $(BUILD)/ZenIdleModel.kext.o || true
-	@echo "static initializers:"; otool -l $(BUILD)/ZenModel.kext.o $(BUILD)/ZenIdleModel.kext.o | grep -c mod_init_func || true
+	$(KCXX) $(KFLAGS) -c $< -o $@
+
+kcheck: $(KOBJECTS)
+	@echo "undefined symbols:"
+	@nm -u $(KOBJECTS)
+	@echo "static initializers:"
+	@otool -l $(KOBJECTS) | grep -c mod_init_func || true
 
 clean:
 	rm -rf $(BUILD)

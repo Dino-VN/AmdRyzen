@@ -279,13 +279,98 @@ uint32_t idleDeepLatencyUs(const CstEntry *cst, uint32_t n, int32_t cstIndex) {
     return kIdleDeepLatencyDefaultUs;
 }
 
+void buildPreferredCoreOrder(const uint16_t *primaryOfCore, const uint16_t *coreOfCpu,
+                             const uint16_t *rankOfCore, uint32_t ncpu, uint32_t ncores,
+                             PreferredCoreTable *out) {
+    if (!out) return;
+    out->count = 0;
+    for (uint32_t i = 0; i < kPrefMaxCpus; ++i) {
+        out->siblingOfCpu[i] = 0xFFFFu;
+        out->rankOfCpu[i] = 0;
+    }
+    for (uint32_t i = 0; i < kPrefMaxCores; ++i) out->primaryCpu[i] = 0xFFFFu;
+    if (!primaryOfCore || !coreOfCpu || !rankOfCore || ncpu == 0 || ncores <= 1) return;
+    if (ncpu > kPrefMaxCpus) ncpu = kPrefMaxCpus;
+    if (ncores > kPrefMaxCores) ncores = kPrefMaxCores;
+
+    uint16_t minRank = 0xFFFFu, maxRank = 0;
+    for (uint32_t k = 0; k < ncores; ++k) {
+        const uint16_t r = rankOfCore[k];
+        if (r == 0 || primaryOfCore[k] >= ncpu) return;
+        if (r < minRank) minRank = r;
+        if (r > maxRank) maxRank = r;
+    }
+    if (minRank == maxRank) return;          // all cores equal rank: no steering needed
+
+    uint16_t firstInCore[kPrefMaxCores];
+    for (uint32_t k = 0; k < ncores; ++k) firstInCore[k] = 0xFFFFu;
+    for (uint32_t c = 0; c < ncpu; ++c) {
+        const uint16_t k = coreOfCpu[c];
+        if (k >= ncores) continue;
+        out->rankOfCpu[c] = rankOfCore[k];
+        if (firstInCore[k] == 0xFFFFu) {
+            firstInCore[k] = (uint16_t)c;
+        } else {
+            const uint16_t peer = firstInCore[k];
+            out->siblingOfCpu[peer] = (uint16_t)c;
+            out->siblingOfCpu[c] = peer;
+        }
+    }
+
+    // Insertion sort cores by descending CPPC rank (stable on core index).
+    uint16_t order[kPrefMaxCores];
+    for (uint32_t k = 0; k < ncores; ++k) {
+        uint32_t pos = k;
+        while (pos > 0 && rankOfCore[k] > rankOfCore[order[pos - 1]]) {
+            order[pos] = order[pos - 1];
+            --pos;
+        }
+        order[pos] = (uint16_t)k;
+    }
+    for (uint32_t i = 0; i < ncores; ++i) out->primaryCpu[i] = primaryOfCore[order[i]];
+    out->count = ncores;
+}
+
 uint32_t idleWindowBusyPermille(uint64_t prevAcc, uint64_t curAcc, uint64_t windowTicks) {
-    if (windowTicks == 0) return 1000;
-    uint64_t idle = curAcc > prevAcc ? curAcc - prevAcc : 0;
-    if (idle >= windowTicks) return 0;
+    if (windowTicks == 0 || curAcc < prevAcc) return 1000;
+    const uint64_t idle = curAcc - prevAcc;
+    if (idle > windowTicks) return 1000;
     const uint64_t busy = windowTicks - idle;
     if (busy <= UINT64_MAX / 1000ull) return (uint32_t)(busy * 1000ull / windowTicks);
     return (uint32_t)(busy / (windowTicks / 1000ull));        // windowTicks > 2^54 here
+}
+
+IdleWindow idleWindowAdvance(IdleSnapshot *baseline, const IdleSnapshot &cur, bool reset) {
+    IdleWindow w { kIdleSampleInvalid, 1000 };
+    if (!baseline) return w;
+    if (!cur.valid) {
+        baseline->valid = false;
+        return w;
+    }
+    const IdleSnapshot prev = *baseline;
+    *baseline = cur;                         // only a coherent endpoint can re-prime
+    if (reset || !prev.valid) {
+        w.status = kIdleSamplePrimed;
+        return w;
+    }
+    if (cur.tsc <= prev.tsc || cur.idleAcc < prev.idleAcc || cur.entries < prev.entries)
+        return w;
+    const uint64_t window = cur.tsc - prev.tsc;
+    if (cur.idleAcc - prev.idleAcc > window) return w;   // never clamp bad data to idle
+    w.busyPermille = idleWindowBusyPermille(prev.idleAcc, cur.idleAcc, window);
+    w.status = kIdleSampleReady;
+    return w;
+}
+
+GovSamplePlan planGovernorSample(bool dynamic, bool reset, bool idleReady, bool telemetry,
+                                 bool perfLastTick, bool havePerf) {
+    GovSamplePlan p { kGovSampleHold, false, false };
+    const bool useIdle = dynamic && !reset && idleReady;
+    p.samplePerf = telemetry || (dynamic && !useIdle && havePerf);
+    if (useIdle) p.source = kGovSampleIdle;
+    else if (dynamic && !reset && perfLastTick && havePerf) p.source = kGovSamplePerf;
+    p.nextPerfFresh = dynamic && havePerf && p.samplePerf;
+    return p;
 }
 
 } // namespace zen

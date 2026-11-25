@@ -1,0 +1,44 @@
+{
+  "purpose": "Inert protocol/layout references only; no source is executed or linked, and tests never fetch them.",
+  "local_repository_sources": [
+    {
+      "path_from_repository_root": "deps/linux-src/include/acpi/cppc_acpi.h",
+      "sha256": "ce8bf9cc47a10d517c35dd457463b314e115984506becad8a05077910c31c5d6",
+      "symbols": ["CPPC_V3_REV", "CPPC_V3_NUM_ENT", "CMD_READ", "PCC_CMD_COMPLETE_MASK", "PCC_ERROR_MASK", "enum cppc_regs", "struct cpc_reg"],
+      "lines": "20-35, 52-61, 101-126"
+    },
+    {
+      "path_from_repository_root": "deps/linux-src/drivers/acpi/cppc_acpi.c",
+      "sha256": "89bced1ff8b96dee2f5c1194627e8e48103c6da1fea4c04fc6d8523e6f846239",
+      "symbols": ["CPC_PCC_HEADER_SIZE", "GET_PCC_VADDR", "IS_NULL_REG", "REG_OPTIONAL", "cpc_integer_entry_valid", "GET_BIT_WIDTH", "check_pcc_chan", "send_pcc_cmd", "register_pcc_channel"],
+      "lines": "169-205, 229-269, 316-322, 1392-1422, 1463-1554, 1781-1789",
+      "note": "Lab deliberately does not implement pending writes, Linux's nominal-derived timeout, or its fixed-window rate counter. No firmware execution or hardware read/write code is copied."
+    }
+  ],
+  "supplementary_references": [
+    {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v6.12/include/acpi/actbl2.h",
+      "local_read_copy": "build/reference/actbl2.h",
+      "sha256": "61a442b2a6c44c1b1ae4da90d17de90448a9d2999160713ea8e918c59de76d4a",
+      "symbols": ["acpi_table_madt", "acpi_madt_local_apic", "acpi_madt_local_x2apic", "ACPI_MADT_ENABLED", "ACPI_MADT_ONLINE_CAPABLE", "acpi_table_pcct", "acpi_pcct_subspace", "acpi_pcct_shared_memory"],
+      "lines": "930-991, 1080-1086, 1430-1433, 2176-2215, 2337-2343"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v6.12/include/acpi/pcc.h",
+      "local_read_copy": "build/reference/pcc.h",
+      "sha256": "da8c2a986cf5b7ba391135518c22854d0aaa2982be9d8be26f3cb376ee7e9890",
+      "symbols": ["PCC_SIGNATURE", "PCC_CMD_GENERATE_DB_INTR", "PCC_STATUS_CMD_COMPLETE", "PCC_STATUS_SCI_DOORBELL", "PCC_STATUS_ERROR", "PCC_STATUS_PLATFORM_NOTIFY", "MAX_PCC_SUBSPACES"],
+      "lines": "21-33",
+      "note": "Simulated initialization seeds a synthetic signature/OS-owned header, not observed firmware state. Lab capacity 8 is not the protocol's 256-subspace limit."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/mailbox/pcc.c",
+      "local_read_copy": "build/reference/pcc.c",
+      "sha256": "0edab591c7783a7205ceedb7c6c741ab7fdb66119b981620c74fb67b99c4d875",
+      "symbols": ["pcc_chan_reg_read_modify_write", "pcc_mbox_request_channel", "pcc_send_data", "pcc_parse_subspace_shmem"],
+      "lines": "198-210, 322-355, 388-401, 623-644",
+      "note": "References establish mask calculation, ordinal subspaces and timing metadata. No live mailbox, mapping, MMIO or interrupt implementation is included in the lab."
+    }
+  ],
+  "availability": "Supplementary headers were absent from the partial deps checkout; pinned upstream text was fetched read-only into a new ignored reference directory. Nothing is installed, built or auto-downloaded from that directory."
+}

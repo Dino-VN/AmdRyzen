@@ -1,0 +1,59 @@
+{
+  "checksum_meaning": "ACPI byte sum modulo 256 is corruption detection, NOT a digital signature or proof of authenticity. Derived checksums/hashes do not identify original tables.",
+  "derived_raw_tables": {
+    "MADT": {
+      "bytes": 350,
+      "checksum_mod256": 0,
+      "sha256": "c7124fe92f8cc881b35800ef7597c31ca0f8eaaf1546ba91a64da3a83ae4ddb9"
+    },
+    "PCCT": {
+      "bytes": 110,
+      "checksum_mod256": 0,
+      "sha256": "b1bb8168007aaacdeddd115c04d4e82dba0a90b8c41245ff679678c1b129ac72"
+    }
+  },
+  "fixture_file_sha256": {
+    "madt.hex": "2728c4a8d80014bf56b4cba2a74fddc351958c1fc398b001ba407db041fee655",
+    "pcct.hex": "6b4e921eb7ae840cfb6b1f4e97ae56452a52c14f1298652b79533c92d498f185",
+    "static.cpc": "d5fdb6087f9f0665835fa41ad2964608e7a1cb7befa738e4bb73477f8f0edcc9",
+    "xnu.map": "f2d831bd85447d3a79a3522b6795301f1086a37257c5b939527dbfa8415dccd8"
+  },
+  "identity_source": "SSDT-2 static Processor declarations, joined by namespace path; not MADT list position",
+  "kind": "derived/sanitized offline regression fixture; NOT original firmware",
+  "normalization": "Static verified revision-3/23-entry Name packages only; no AML interpreter/evaluation",
+  "sanitization": {
+    "both_tables": "OEM/creator metadata replaced with LAB / DERIVED; byte-9 checksum recomputed",
+    "cpc": "lossless integer/resource bytes, redundant JSON annotations omitted",
+    "madt": "local APIC and I/O APIC addresses replaced; all CPU records/order/disabled placeholders retained",
+    "pcct": "base and doorbell replaced with 0x100000 and 0x200000 inert labels"
+  },
+  "source_file_sha256": {
+    "cpc": "d0da48d4af4d91fc37fc1cbb1da13f48c289053929402c20b8cfa7b2c2787cff",
+    "manifest": "809579e49e397561ef4bc7a7c67a556239dbefbfffb91b53e657fb13ed087fb1",
+    "plist": "d4377b37980199c35a5cfb08d6a5d85c42202effa749d2fe3b181596de74fdb5"
+  },
+  "source_provenance": "Saved AppleACPIPlatformExpert ACPI Tables property; OS-exposed post-boot-patch tables",
+  "source_tables": {
+    "APIC": {
+      "bytes": 350,
+      "checksum_mod256": 0,
+      "sha256": "d4879c22b99e84feaa67cd54ca2ea1bfaf16e951e42ecb5654936fb973ef4c23"
+    },
+    "PCCT": {
+      "bytes": 110,
+      "checksum_mod256": 0,
+      "sha256": "5a31529d042b238e4a4dc3d8f7ccbe9cd1e2dbb3845f78caea31b244afcf50a0"
+    },
+    "SSDT-2": {
+      "bytes": 252,
+      "checksum_mod256": 0,
+      "sha256": "bdfb454245935efe3ef7174a9efa5324c742764fcf40a8632221fd27fcf189f3"
+    },
+    "SSDT-3": {
+      "bytes": 16451,
+      "checksum_mod256": 0,
+      "sha256": "f22c5c2615bcd436bdd5601ee16d3e6269187018220ddf1e21b26efd73fe6013"
+    }
+  },
+  "xnu_mapping": "SYNTHETIC permutation, not measured; all physical/live values remain unverified"
+}

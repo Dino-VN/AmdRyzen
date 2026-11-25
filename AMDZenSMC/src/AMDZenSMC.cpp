@@ -42,7 +42,7 @@ static_assert(smc::makeKey('s', 'p', '7', '8') == SmcKeyTypeSp78, "type packing"
 
 namespace {
 
-constexpr uint32_t kDefaultPeriodMs = 500;      // half of AMDZenPM's default 1 s telemetry
+constexpr uint32_t kDefaultPeriodMs = 1000;     // matches AMDZenPM's default 1 s telemetry
 constexpr uint32_t kMinPeriodMs     = 250;
 constexpr uint32_t kMaxPeriodMs     = 5000;
 // AMDZenPM defers discovery up to 30 s after its start; allow for that plus slack.
@@ -246,8 +246,8 @@ void AMDZenSMC::timerFired(IOTimerEventSource *sender) {
     refresh();
     uint32_t period = kDefaultPeriodMs;
     if (haveSeq && sample->intervalUs) {
-        // Poll at half the telemetry period; faster reads would only return the same seq.
-        period = sample->intervalUs / 2000;
+        // Match AMDZenPM's telemetry period so we do not wake twice per sample.
+        period = sample->intervalUs / 1000;
         if (period < kMinPeriodMs) period = kMinPeriodMs;
         if (period > kMaxPeriodMs) period = kMaxPeriodMs;
     }

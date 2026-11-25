@@ -1,0 +1,102 @@
+OFFLINE NORMALIZED INPUT CONTRACT, VERSION 1
+
+This format is DATA, not AML/ASL, a scripting language or a firmware evaluator.
+The producer must independently verify that packages were static and record
+provenance. A file's magic does not establish provenance. Parsing/import success
+never implies a working channel, usable native policy, or permission to access
+hardware. All outputs are usable only when the function returns Code::Ok.
+
+Tokens are ASCII separated by spaces, tabs, CR or LF. # starts a line comment.
+Numbers are unsigned decimal or 0x hexadecimal, without signs or expressions.
+Overflow is an error. No octal interpretation, quoting, includes or file paths
+inside the normalized data. Trailing tokens after END are rejected.
+
+STATIC CPC (third CLI input)
+
+  CPPC_STATIC_V1
+  CPUS <1..64>
+  CPU <canonical-absolute-path> <LAPIC|X2APIC> <ProcessorID-or-numeric-UID>
+  PSD <NumEntries> <Revision> <Domain> <CoordType> <NumProcessors>
+  CPC <actual-package-element-count>
+  I <NumEntries>
+  I <Revision>
+  <21 field entries in the order below>
+  ENDCPU
+  ...repeat CPU block...
+  END
+
+Canonical paths contain backslash plus four-character ACPI NameSegs separated
+by dots: e.g. \_PR_.C000. No implicit padding/relative names. The path identifies
+the normalized package; its suffix is NEVER used as a ProcessorID or CPU number.
+LAPIC joins the MADT type-0 ProcessorID namespace. X2APIC joins the type-9 numeric
+UID namespace. String UIDs and other processor forms are unsupported here.
+
+Each field entry is either I <u64> or B <contiguous-hex-resource-buffer>.
+The B resource is exactly 17 bytes: 82 0c 00, twelve GAS bytes, 79 <checksum>.
+A zero EndTag checksum means resource checksum omitted, not sum modulo 256=0.
+A nonzero EndTag checksum is validated over all 17 bytes. The null descriptor
+is exactly SystemMemory/width=0/offset=0/access=0/address=0. PCC offset zero
+with a nonzero width is valid, not an unsupported/zero performance value.
+
+Field order (package entries 2..22, zero based):
+ HighestPerformance, NominalPerformance, LowestNonlinearPerformance,
+ LowestPerformance, GuaranteedPerformance, DesiredPerformance,
+ MinimumPerformance, MaximumPerformance, PerformanceReductionTolerance,
+ TimeWindow, CounterWraparoundTime, ReferenceCounter, DeliveredCounter,
+ PerformanceLimited, CPPCEnable, AutonomousSelectionEnable,
+ AutonomousActivityWindow, EnergyPerformancePreference, ReferencePerformance,
+ LowestFrequency, NominalFrequency.
+
+Only NumEntries=23 / Revision=3 and PSD=(5,0,domain,254,members) are supported.
+Domain IDs may be noncontiguous; declared membership must equal joined count.
+PCC registers of one CPU must refer to one supported PCCT subspace. The subspace
+is the GAS AccessSize byte, not log2(access bytes). GAS address is relative to
+payload AFTER the 8-byte header. Bit offsets/partial fields are not implemented.
+
+Integer rules: first four capability values must be positive u32; optional
+reference performance and frequency anchors are u32 (zero means absent).
+Wraparound time may be u64 (zero absent). AutonomousSelection integer 0/1 is a
+known immutable static value, NOT the same as a null register. Other optional
+integer-zero placeholders mean unsupported. Other integer controls, including
+a DesiredPerformance zero placeholder, are outside this strict lab profile.
+No missing value is converted to a frequency, enable state or fallback target.
+
+CALLER XNU MAP (fourth CLI input)
+
+  XNU_MAP_V1
+  CPUS <1..64>
+  MAP <APIC-or-x2APIC-ID-u32> <XNU-cpu-number-0..INT32_MAX>
+  ...repeat MAP...
+  END
+
+Entries may be reordered, sparse or noncontiguous, but APIC IDs and XNU numbers
+must each be unique. Every active MADT CPU must have exactly one CPC package
+and mapping. Disabled/online-capable-only CPUs cannot satisfy active joins.
+The supplied fixture is explicitly SYNTHETIC and is not this host's XNU map.
+
+RAW TABLES (first two CLI inputs)
+
+--binary consumes raw saved PCCT and MADT (signature APIC) files. --hex consumes
+the same bytes as two-digit hex tokens with # comments. No firmware discovery
+or extraction occurs. Supplied byte length must equal the ACPI header length;
+truncated, oversized, checksum-invalid or unsupported structures fail. The
+simulator accepts no mapped memory pointer or hardware transport callback.
+
+REPRODUCING THE FIXTURE (not needed for make check)
+
+The optional generator is capture-specific and hash-locked, not a general
+normalizer. It verifies raw table lengths/checksums/hashes against the saved
+manifest, CPC resource bytes/fields against saved static blocks, and explicit
+ProcessorID/name pairs against SSDT-2 bytes. It never evaluates AML. Source
+filenames embedded in JSON are ignored. All paths must be provided explicitly.
+Always use Python isolated mode when reading the captured files:
+
+/usr/bin/python3 -I /Volumes/Data/Projects/AmdCpu/tools/cppc-lab/scripts/make_fixture.py \
+  --tables-plist /private/tmp/cppc-host.dbCOJd/data/live-acpi-tables.plist \
+  --manifest-json /private/tmp/cppc-host.dbCOJd/data/live-table-manifest.json \
+  --cpc-json /private/tmp/cppc-host.dbCOJd/data/cpc-descriptors.json \
+  --output-dir /Volumes/Data/Projects/AmdCpu/tools/cppc-lab/fixtures --check
+
+--check compares five files byte-for-byte without writing. For generation,
+omit --check and select a NEW EMPTY output directory under this lab. Originals
+are read only; full firmware tables/bundles are never copied into the fixture.

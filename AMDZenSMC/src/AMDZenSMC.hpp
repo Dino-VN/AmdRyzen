@@ -93,7 +93,7 @@ private:
     // Must stay valid and unchanged after submission; VirtualSMC keeps the pointer.
     VirtualSMCAPI::Plugin vsmcPlugin {
         "AMDZenSMC",
-        parseModuleVersion("1.0.0"),
+        parseModuleVersion("0.0.1"),
         VirtualSMCAPI::Version,
     };
 };

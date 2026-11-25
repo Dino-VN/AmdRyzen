@@ -110,6 +110,13 @@ struct PerfDerived {
 // prev/cur are raw counters (64-bit, wrap-safe by unsigned subtraction).
 PerfDerived derivePerf(const PerfCounters &prev, const PerfCounters &cur, uint64_t tscHz,
                        uint32_t refFreqMHz, bool haveIrperf);
+// Fast governor only: missing timestamps and counter/clock resets are unknown,
+// not zero load. Conservatively discard a 64-bit wrap interval as well; telemetry
+// keeps derivePerf's wrap-safe arithmetic. Freshness across ticks is checked by
+// the timer separately, before this per-CPU validation.
+static inline bool governorPerfWindowValid(const PerfCounters &prev, const PerfCounters &cur) {
+    return prev.tsc != 0 && cur.tsc > prev.tsc && cur.aperf >= prev.aperf && cur.mperf >= prev.mperf;
+}
 
 // ------------------------------------------------------------------ governors
 // P-state table for the legacy backend. Index 0 = fastest (P0). Only entries

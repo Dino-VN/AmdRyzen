@@ -12,6 +12,7 @@ Each function is modelled on a Linux driver:
 | Effective frequency, load, IPC | `aperfmperf`, turbostat | APERF/MPERF/TSC/IRPERF |
 | P-state control | `acpi-cpufreq` | C001_0061..006B, written per thread |
 | CPPC + EPP | `amd-pstate` (MSR path) | C001_02B0..02B4 |
+| Autonomous CPPC + native macOS signals | `amd-pstate` (ACPI PCC path) | `_CPC` / PCCT shared memory; scheduler urgency and native power/thermal hints |
 | Boost (CPB) | `acpi-cpufreq` boost | HWCR[25] |
 | Governors | schedutil / ondemand / conservative | `ZenModel.cpp`, integer math only |
 
@@ -42,7 +43,8 @@ Settings are applied in this order of priority: boot-arg, then the keys in `Info
 | Boot-arg | Meaning |
 |---|---|
 | `-amdzenoff` | Do not load |
-| `-amdzenro` | Monitor only; never write control MSRs |
+| `-amdzenro` | Monitor only; block all control writes, including PCC |
+| `-amdzennocppc` | Disable CPPC selection; retain the legacy P-state backend |
 | `amdzen.gov=<name>` | `performance`, `powersave`, `schedutil`, `ondemand`, `conservative`, `userspace`, `active` (CPPC only), `none` or `auto` |
 | `amdzen.boost=0\|1` | Force boost off or on (default: leave as the BIOS set it) |
 | `amdzen.epp=0..255` | EPP for `active` mode (128 = balance_performance) |
@@ -52,7 +54,21 @@ Settings are applied in this order of priority: boot-arg, then the keys in `Info
 | `amdzen.pstatewrite=1` | Allow editing P-state definitions (FID/DID/VID) through the user client |
 | `amdzen.idle=auto\|0\|1\|2\|3` | CC6 idle hook (see below). `auto` (default): CC6 when the hardware checks pass, otherwise no hook. `0`: never install the hook. `1`: HLT. `2`: MWAIT C1. `3`: CC6 for long idles, MWAIT C1 for short ones |
 
-`auto` selects `schedutil` on the legacy P-state backend and `active` with EPP on the CPPC backend. The Ryzen 5000 desktop parts, including the 5700X, have no CPPC MSRs, so they use the legacy backend.
+`auto` selects `schedutil` on the legacy backend and `active` on CPPC. On CPUs without CPPC MSRs, including the Ryzen 7 5700X, **CPPC over PCC is on by default** when ACPI discovery and capability checks succeed. No opt-in boot-arg is needed. `-amdzennocppc` retains legacy control on a fresh boot; `-amdzenro` blocks both MSR and PCC writes. Neither option permits legacy control after a PCC enable attempt in the same boot.
+
+The `cppc-pcc` backend runs autonomous native policy adaptively (50 ms while active, 200 ms when quiet): firmware selects frequency inside the requested range (`desired=0`), guided by scheduler urgency, per-CPU idle-derived busy load, AC power, thermal warnings and low-power-mode state (`kern.amdzen.lpm`: `-1` auto, `0` off, `1` on). Unknown native signals remain unknown. `kern.amdzen.epp` is the balanced base EPP; RT/background/busy hints adjust the per-CPU requests. This backend accepts `active` or `none` (which leaves a neutral autonomous request); legacy governors and P-state editing are unavailable. Boost `-1` (keep) preserves each CPU’s discovered boot setting. If either SMT sibling had boost disabled, active policy caps their shared maximum at nominal and preparation preserves HWCR.CpbDis. Explicit boost on/off changes CpbDis and the policy ceiling; returning to `-1` restores the boot setting. The native period is independent of `amdzen.period`.
+
+Discovery/capability failures before any observed enable or enable attempt retain legacy policy. Before attempting enable, AMDZenPM sets `AMDZenPM.CPPCEnableMayHaveBeenSent` on the persistent IORegistry root and permanently retains its module, even when the idle hook is off. This conservative latch also covers an enable preflight failure. Once set, a replacement service or module reload without a live Channel remains `cppc-pcc`, degraded and without control writes until reboot; legacy/MSR control cannot resume. Transport/protocol and prerequisite failures quarantine writes with `block_reason=pcc-failed` and a numeric error.
+
+Sleep cancels between every PCC command and phase, drains the single admitted command (transport budget about two seconds, plus scheduling/publication), and keeps the channel mapped. Wake validates enable/autonomy, accepted requests, P0 and CpbDis on every CPU, including partial firmware enablement and governor `none`. Disabled CPUs regain P0 before enable; an already enabled CPU with a lost P0 prerequisite is quarantined. Stop drains work, clears urgency, releases signals, submits a neutral request best-effort when writes remain permitted, then unmaps. Neutral requests use each shared domain’s capability intersection, so aliased SMT registers receive identical values. CPPC is never disabled.
+
+### Governor sampling
+
+With an active idle hook, legacy dynamic governors use coherent per-CPU idle accounting by default (`GovIdleSampling`, `amdzen.govidle`, or `kern.amdzen.gov_idle_sampling`). Each CPU's snapshot carries its own timestamp and includes an open idle interval. No new idle exits can mean either fully busy or still idle; the accounted time distinguishes them. Stable requests need no governor IPI; telemetry still samples APERF/MPERF (default every 1 s).
+
+The default governor period remains **40 ms**. Schedutil requests the fastest **allowed** P-state at **60% busy or above**, irrespective of its smoothed frequency estimate (`FastUpPct`, `amdzen.fastup`, or `kern.amdzen.fast_up_pct`; 0 disables fast-up). Below that threshold, idle-derived utilization estimates frequency from the last requested P-state, not measured boost or throttling.
+
+A snapshot retries at most eight times. Invalid accounting or a source change re-primes the affected baselines; fallback uses only real APERF samples from consecutive dynamic ticks. Without a usable pair, requests and governor history are held, not lowered from an unknown sample. Sleep/wake resets both sources. `Sensors.GovSource` reports `idle`, `aperf`, or `hold` (priming/no usable decision).
 
 ## Monitoring and runtime control
 
@@ -69,7 +85,9 @@ ioreg -l -w0 -c AMDZenPM | grep -A40 '"Sensors"'
 
 The IORegistry entry `CPUInfo` holds static data: the P-state table, features, CPPC capabilities and topology. The `Sensors` entry is updated once per `TelemetryPeriodMs` (default 1 s).
 
-For tools, the `AMDZenPMUserClient` user client exposes `AMDZenInfo` and `AMDZenSample` (see `AMDZenPM/src/AMDZenShared.h`). Any user can read; only an admin can change settings. For other kernel extensions, AMDZenPM exports `AMDZenPM_copyInfo()` and `AMDZenPM_copySample()` (`OSBundleCompatibleVersion` 1.0.0).
+PCC diagnostics are `kern.amdzen.pcc_commands`, `pcc_latency_us`, `pcc_last_error`, and `pcc_state`. `cppc_highest`, `cppc_nominal`, `cppc_lowest_nonlinear`, and `cppc_lowest` report CPU0 capabilities; `cppc_min`, `cppc_max`, `cppc_epp`, and `cppc_requests` report the last accepted requests in XNU CPU order. Native signals are `native_ac_power` (`unknown/ac/battery`), `native_thermal` (0 unknown, 1 nominal through 5 emergency), `native_low_power_mode` (`unknown/off/on`), `native_rt_active`, `native_rt_mask`, and `native_urgency_active`. Error values are defined in `ZenPccModel.hpp`; 65536/65537/65538/65539/65540 mean policy/confirmation/interrupted/prerequisite/lifetime-latch failures. A firmware WRITE timeout leaves the actual request uncertain; diagnostics retain the last confirmed request.
+
+For tools, the `AMDZenPMUserClient` user client exposes `AMDZenInfo` and `AMDZenSample` (see `AMDZenPM/src/AMDZenShared.h`). Any user can read; only an admin can change settings. For other kernel extensions, AMDZenPM exports `AMDZenPM_copyInfo()` and `AMDZenPM_copySample()` (`OSBundleCompatibleVersion` 0.0.1).
 
 ## SMC keys (AMDZenSMC.kext)
 
@@ -90,7 +108,7 @@ For tools, the `AMDZenPMUserClient` user client exposes `AMDZenInfo` and `AMDZen
 - The key set is decided once, when AMDZenPM has finished its hardware discovery, and does not change afterwards. `ioreg -l -w0 -c AMDZenSMC` shows `SMCKeys` and `Status`.
 - No frequency keys: no real Mac has one, and VirtualSMC asks plugins not to invent keys. Frequencies are in AMDZenPM's IORegistry entry, sysctl and user client.
 - Tjmax-relative keys (`TC0E`, `TC0F`, `TCXR`...), `PSTR` (system total) and `PC0R` (12 V input) are not published.
-- Values refresh every 500 ms (half of `TelemetryPeriodMs`). Encoding is integer-only, and an SMC read only copies a pre-encoded value.
+- Values refresh every 1000 ms (aligned with `TelemetryPeriodMs`). Encoding is integer-only, and an SMC read only copies a pre-encoded value.
 - Multi-CCD parts get `TCXc` but no per-core keys: `AMDZenInfo` has no core-to-CCD map yet.
 
 **Installing (OpenCore `Kernel → Add`, in this order):**
@@ -120,9 +138,9 @@ Without a power-management kext, macOS idles every CPU with `sti; hlt`. On Zen t
   - The CPU has ARAT and an invariant TSC.
   - For `auto`: CStateAddr is non-zero and identical on every CPU, HWCR[4] is set, and CC6 is enabled for the chosen CCR. An explicit `amdzen.idle=1|2|3` installs the hook anyway, limited to what the hardware supports.
 - **Cannot be unloaded once installed.** The kernel keeps a pointer to the kext's table, and no exported call removes it. AMDZenPM therefore takes a permanent reference on itself. Stopping the driver only restores the kernel's own HLT idle. **If the system hangs at boot or after wake, disable the hook with `amdzen.idle=0` from the OpenCore boot picker.** If your picker setup cannot edit boot-args, add it to `boot-args` under `NVRAM → Add → 7C436110-AB2A-4BBB-A880-FE41995C9F82` in `config.plist` from another OS (the EFI partition is FAT), or run `nvram boot-args="... amdzen.idle=0"` from Recovery. With `amdzen.idle=0` the kext still reads the C-state MSRs for `CPUInfo`, but it does not evaluate `_CST` and does not install the hook.
-- **Sleep:** before sleep the hook drops to MWAIT. After wake, it reads C001_0073/0296 again on every CPU. CC6 is re-enabled only if the values are unchanged. If they changed, the hook stays at MWAIT until the next reboot.
+- **Sleep:** before sleep the hook drops to HLT. After wake, it checks HWCR and C001_0073/0296 again on every CPU before restoring MWAIT/CC6. Lost capabilities stay disabled until reboot. Governor sampling baselines are reset so no window spans sleep.
 - **Status:** see `CPUInfo` in the IORegistry. `IdleHook` reads `registered` or gives the reason the hook was not installed. `IdleCC6` reads `ok` or gives the reason CC6 is unavailable. The entry also holds `CStateBaseAddr`, `CStateCfg`, `CStatePolicy`, `IdlePort`, `IdleCcr`, `IdlePortSource` and `AcpiCST` (array of `{Type, Space, Port, Latency}`).
-  - `Sensors` adds `IdleMode`, `CC6Residency_permille`, `C1Residency_permille`, `IdleEntriesDeep` and `IdleEntriesShallow` (entries per second).
+  - `Sensors` adds `IdleMode`, `CC6Residency_permille`, `C1Residency_permille`, `IdleEntriesDeep`, `IdleEntriesShallow`, `IdleMonitorWakes` and `IdleTimerMigrates` (counts per second).
 
 Comparing idle power (leave the machine idle for each step):
 
@@ -140,7 +158,7 @@ If CC6 works, `cores_power_mw` in mode 3 should be well below the HLT value, and
 - Every MSR is probed with `rdmsr_carefully` on every CPU before use. A capability counts only if the read worked on all CPUs. MSRs are written only after that check, because the kernel exports no `wrmsr_carefully`.
 - **HWCR:** only bit 25 (CpbDis) and bit 30 (IRPerfEn) are ever changed.
 - **Delayed start:** hardware initialisation waits, for up to 30 s, until every CPU is online and PCI 00:00.0 has appeared.
-- **Sleep, unload and conflicts:** before sleep, every thread is returned to P0. On wake, CPPC, boost and the active policy are applied again. On unload, P0, the boot CPPC request and the boot boost state are restored. If a conflicting kext appears later, AMDZenPM does the same restore and switches to monitor-only.
+- **Sleep, unload and conflicts:** legacy control returns every thread to P0 before sleep and restores boot boost on stop/conflict. MSR CPPC restores its boot request. PCC follows the drain/check/neutral lifecycle above and never returns to legacy writes after enable. A late conflict atomically revokes native admission and drains an already admitted command outside the work-loop gate before the notification handoff completes. No command is admitted afterward.
 - **P-state editing:**
   - It is off unless `amdzen.pstatewrite=1` is set.
   - It is supported only on SVI2 parts in family 17h/19h.
@@ -149,7 +167,7 @@ If CC6 works, `cores_power_mw` in mode 3 should be well below the HLT value, and
 
 ## Not done yet
 
-- **CC6 idle hook:** booted and measured on a 5700X (idle cores 4.2 W with MWAIT C1, 2.1 W with CC6 at 50 µs). Sleep/wake with the hook active is not yet tested. Its `pmDispatch_t` layout is checked only for Darwin 20–25.
-- **ACPI `_CPC` (shared-memory CPPC):** needed for Zen3 desktop with CPPC enabled in the BIOS.
+- **CC6 idle hook:** booted and measured on a Ryzen 7 5700X (with MWAIT monitor-write wakeup, `rtcDeadline` timer migration, and CPPC preferred-core routing; 87.5% idle CC6 residency, 0 latency vetoes). Sleep/wake with the hook active is not yet tested. Its `pmDispatch_t` layout is checked only for Darwin 20–25.
+- **PCC hardware validation:** booted and verified on a Ryzen 7 5700X (macOS 26 / Darwin 25.6.0) with live ACPI PCC discovery, autonomous CPPC/EPP policy, and preferred-core selection. Sleep/wake and native thermal/LPM transitions remain to be verified across additional Zen hardware. See `docs/research/native-policy.md` for signal limits and [native-integration-fixes.md](docs/research/native-integration-fixes.md) for offline integration notes.
 - **`zenctl` command-line tool**
 - **SVI3 telemetry (Zen4/Zen5):** no public description exists.

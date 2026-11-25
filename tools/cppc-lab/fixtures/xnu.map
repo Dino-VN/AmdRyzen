@@ -1,0 +1,21 @@
+# SYNTHETIC permutation for tests, NOT this host's measured XNU numbering.
+# No live XNU CPU mapping is claimed or discovered by this lab.
+XNU_MAP_V1
+CPUS 16
+MAP 15 14
+MAP 14 9
+MAP 13 4
+MAP 12 15
+MAP 11 10
+MAP 10 5
+MAP 9 0
+MAP 8 11
+MAP 7 6
+MAP 6 1
+MAP 5 12
+MAP 4 7
+MAP 3 2
+MAP 2 13
+MAP 1 8
+MAP 0 3
+END

@@ -20,7 +20,7 @@ BUILD    := $(ROOT)/build
 
 NAME     := AMDZenPM
 BUNDLEID := com.dinovn.AMDZenPM
-VERSION  := 1.0.0
+VERSION  := 0.0.1
 SRCDIR   := $(ROOT)/AMDZenPM/src
 PLIST    := $(ROOT)/AMDZenPM/Info.plist
 KEXT     := $(BUILD)/$(NAME).kext
@@ -46,7 +46,7 @@ OBJS     := $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SRCS)) $(OBJDIR)/kmod_inf
 # load time; the SDK headers are vendored in third_party/ (BSD-3, see its README).
 SMC_NAME     := AMDZenSMC
 SMC_BUNDLEID := com.dinovn.AMDZenSMC
-SMC_VERSION  := 1.0.0
+SMC_VERSION  := 0.0.1
 SMC_SRCDIR   := $(ROOT)/AMDZenSMC/src
 SMC_PLIST    := $(ROOT)/AMDZenSMC/Info.plist
 SMC_KEXT     := $(BUILD)/$(SMC_NAME).kext
@@ -115,7 +115,10 @@ test:
 	  echo "tests/Makefile not present; skipping host unit tests"; \
 	fi
 
+kcheck:
+	$(MAKE) -C $(ROOT)/tests kcheck
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all check test clean
+.PHONY: all check test kcheck clean

@@ -17,6 +17,7 @@
 //
 
 #include "ZenHW.hpp"
+#include "AMDZenNativeControl.hpp"
 #include "ZenRegs.h"
 #include "XnuPrivate.h"
 
@@ -268,6 +269,7 @@ struct RunCtx {
     const uint8_t  *pstateReq;
     const uint64_t *cppcReq;
     uint64_t hwcrSet, hwcrClear;
+    const uint64_t *hwcrBoot;
     uint32_t defMsr;
     uint64_t defValue;
     uint64_t *ctlCache;
@@ -289,6 +291,7 @@ static void runAction(void *arg) {
     if (ops & kOpHwcrModify) {
         uint64_t v = zen_rdmsr_raw(MSR_HWCR);
         uint64_t nv = (v & ~ctx->hwcrClear) | ctx->hwcrSet;
+        if (ctx->hwcrBoot) nv = (v & ~HWCR_CPB_DIS) | (ctx->hwcrBoot[i] & HWCR_CPB_DIS);
         if (nv != v) zen_wrmsr_raw(MSR_HWCR, nv);
     }
 
@@ -364,6 +367,38 @@ static void runAction(void *arg) {
         o->hwPstateStatus = (primary && ctx->hwPst) ? zen_rdmsr_raw(MSR_HW_PSTATE_STATUS) : 0;
         o->hwcr = (ctx->ok & kOkHwcr) ? zen_rdmsr_raw(MSR_HWCR) : 0;
     }
+}
+
+// A fresh, carefully-read P0/HWCR check on EVERY CPU before an enable batch.
+// No reliance on the legacy write cache across firmware sleep/wake changes.
+struct AutonomousCpu {
+    amdzen::PrerequisitePlan plan;
+    bool valid;
+};
+struct AutonomousCtx {
+    AutonomousCpu *cpus;
+    const bool *enabled, *boostOn;
+    uint32_t ncpu;
+    bool restore;
+};
+static void autonomousAction(void *arg) {
+    AutonomousCtx &ctx = *static_cast<AutonomousCtx *>(arg);
+    const int c = cpu_number();
+    if (c < 0 || uint32_t(c) >= ctx.ncpu) return;
+    AutonomousCpu &out = ctx.cpus[c];
+    out.valid = false;
+    uint64_t ctl = 0, hwcr = 0;
+    if (!rdOk(MSR_PSTATE_CTL, &ctl) || !rdOk(MSR_HWCR, &hwcr) ||
+        !amdzen::planPrerequisites(ctx.enabled[c], ctx.boostOn[c], ctl, hwcr, out.plan)) return;
+    if (ctx.restore) {
+        // The plan never writes PSTATE_CTL on an enabled CPU. Only CpbDis
+        // changes in HWCR, preserving every other firmware-owned bit.
+        if (out.plan.ctl != ctl) zen_wrmsr_raw(MSR_PSTATE_CTL, out.plan.ctl);
+        if (out.plan.hwcr != hwcr) zen_wrmsr_raw(MSR_HWCR, out.plan.hwcr);
+        if (!rdOk(MSR_PSTATE_CTL, &ctl) || !rdOk(MSR_HWCR, &hwcr) ||
+            (ctl & 7u) || ((hwcr ^ out.plan.hwcr) & HWCR_CPB_DIS)) return;
+    }
+    out.valid = true;
 }
 
 // ---------------------------------------------------------------- idle MSRs
@@ -779,6 +814,7 @@ bool CPU::discover(AMDZenInfo *info, CpuModelInfo *model) {
         }
     }
     for (uint32_t i = 0; i < ncpu; i++) {
+        hwcrCpuBoot[i] = (s->cpu[i].ok & kOkHwcr) ? s->cpu[i].hwcr : HWCR_CPB_DIS;
         if (haveCppc) {
             cppcReqBoot[i] = s->cpu[i].cppcReq;
             cppcReqCache[i] = s->cpu[i].cppcReq;
@@ -803,13 +839,47 @@ bool CPU::discover(AMDZenInfo *info, CpuModelInfo *model) {
     return true;
 }
 
+bool CPU::canPrepareAutonomous() const {
+    return haveLegacy && (feat & AMDZEN_F_CPB) && (okMsr & kOkHwcr) && missing == 0;
+}
+
+bool CPU::prepareAutonomous(const bool *enabled, const bool *boostOn, uint32_t ncpu) {
+    if (!enabled || !boostOn || !canPrepareAutonomous() || !ncpu || ncpu != topology.ncpu)
+        return false;
+    AutonomousCpu *scratch = static_cast<AutonomousCpu *>(IOMallocZero(sizeof(AutonomousCpu) * ncpu));
+    if (!scratch) return false;
+    AutonomousCtx ctx {scratch, enabled, boostOn, ncpu, false};
+    mp_rendezvous_no_intrs(autonomousAction, &ctx);
+    bool ok = true;
+    for (uint32_t c = 0; c < ncpu; ++c) ok &= scratch[c].valid;
+    if (ok) {
+        ctx.restore = true;
+        // Clear all acknowledgement bits: CPUs that disappear must fail closed.
+        for (uint32_t c = 0; c < ncpu; ++c) scratch[c].valid = false;
+        mp_rendezvous_no_intrs(autonomousAction, &ctx);
+        for (uint32_t c = 0; c < ncpu; ++c) ok &= scratch[c].valid;
+    }
+    IOFree(scratch, sizeof(AutonomousCpu) * ncpu);
+    invalidateWriteCache();
+    return ok;
+}
+
 void CPU::run(uint32_t ops, PerCpuRaw *out, const uint8_t *pstateReq, const uint64_t *cppcReq,
               uint64_t hwcrSet, uint64_t hwcrClear, uint32_t defIndex, uint64_t defValue) {
+    // Last line of defence for EVERY legacy/MSR control path (including restore,
+    // wake, userspace definition edits and IRPERF). Native prerequisites use a
+    // separate per-CPU API only while a live PCC Channel owns admission.
+    if (amdzen::pccEnableMayBeThisBoot()) ops &= kOpSamplePerf | kOpSampleSlow;
     if (topology.ncpu == 0 || ops == 0) return;
 
     RunCtx ctx;
     bzero(&ctx, sizeof(ctx));
     uint32_t eff = 0;
+
+    if ((ops & kOpRestoreBootBoost) && (feat & AMDZEN_F_CPB) && (okMsr & kOkHwcr)) {
+        eff |= kOpHwcrModify;
+        ctx.hwcrBoot = hwcrCpuBoot;
+    }
 
     if (ops & kOpHwcrModify) {
         // Only boost-disable and IRPERF-enable may ever be changed.

@@ -5,7 +5,8 @@
 //
 // Configuration priority: boot-args > IOKitPersonality properties > defaults.
 //   boot-args:  -amdzenoff            do not start
-//               -amdzenro             monitor only (never write control MSRs)
+//               -amdzenro             monitor only (blocks MSR and PCC writes)
+//               -amdzennocppc         retain legacy control, skip CPPC backends
 //               amdzen.gov=<name>     performance|powersave|schedutil|ondemand|
 //                                     conservative|userspace|active|none
 //               amdzen.boost=0|1      force Core Performance Boost off/on (default: keep)
@@ -38,6 +39,8 @@
 #include "ZenModel.hpp"
 #include "ZenHW.hpp"
 #include "ZenIdle.hpp"
+#include "ZenCppcTypes.hpp"
+#include <kern/thread_call.h>
 
 class AMDZenPM : public IOService {
     OSDeclareDefaultStructors(AMDZenPM)
@@ -73,6 +76,18 @@ public:
     enum GovKnob : uint32_t { kKnobFastUpPct = 0, kKnobGovIdleSampling = 1 };
     IOReturn setGovKnob(uint32_t which, uint32_t value);
     uint32_t getGovKnob(uint32_t which);
+    IOReturn setLowPowerMode(int32_t mode); // -1 auto, 0 off, 1 on
+    int32_t  getLowPowerMode();
+
+    // Internal diagnostics, outside the stable shared/user-client ABI. Copies
+    // are gated; the PCC worker publishes only after each completed operation.
+    struct NativeDiagnostics {
+        uint64_t commands, latencyUs, rtMask;
+        uint32_t error, stage, cpuCount, acPower, thermal, lowPower, rtActive, hookActive;
+        zencppc::Caps caps;
+        zencppc::Request requests[64];
+    };
+    IOReturn copyNativeDiagnostics(NativeDiagnostics *out);
 
     // The single started instance, retained (caller must release()), or null.
     // Taken under the lock stop() uses to clear it, so a caller can never hold a
@@ -92,8 +107,9 @@ private:
     void     applyPolicy(bool force);     // static governors, boost, limits, EPP
     void     restoreHardware();           // on stop/sleep: P0 / initial CPPC REQ / boot HWCR
     void     timerFired(IOTimerEventSource *src);
-    void     governorTick(uint64_t nowNs);
-    int      governorTickIdle();          // 1 decided, 0 primed, -1 unusable (see .cpp)
+    void     resetGovernorSampling();
+    bool     governorTick();             // false: no usable APERF window; hold requests
+    zen::IdleSampleStatus governorTickIdle();
     void     governLegacyCores(const zen::PStateTable &t, const uint16_t *coreUtil,
                                const uint16_t *coreBusy);
     void     telemetryTick(uint64_t nowNs);
@@ -112,6 +128,30 @@ private:
     void     idleTelemetry(uint64_t nowNs);
     void     publishIdleInfo(OSDictionary *cpuInfo);
     void     publishIdleSensors(OSDictionary *sensors);
+
+    bool     nativeInit();
+    void     nativeFree();
+    void     nativeSchedule();           // gate held; at most one reserved callback
+    void     nativeDrain();              // outside gate, after sleep/stop prevents enqueue
+    void     nativeStop();               // drained; neutral best-effort, then teardown
+    void     nativeCancel(bool permanent = false); // atomic, no waits; gate/lifecycle context
+    void     nativeResume();             // gate-held wake; permanent revocation stays set
+    void     nativeDrainCommands();      // outside gate; drains at most one admitted command
+    void     nativeNudge();              // gate-held: snap back to 50 ms on config change
+    static bool nativeEnableMayBe();     // boot latch, also consulted by ALL legacy control
+    static bool nativeRecordEnable();    // persistent registry latch + permanent module pin
+    bool     nativePrepareHardware(const bool *enabled, const bool *boostOn, uint32_t ncpu);
+    void     nativeRestorePreparation(); // only before a CPPC enable was sent
+    static void nativeThread(thread_call_param_t owner, thread_call_param_t unused);
+    static IOReturn nativeGateAction(OSObject *owner, void *op, void *a1, void *, void *);
+    struct NativeRuntime;
+    NativeRuntime *native {nullptr};
+    thread_call_t nativeCall {nullptr};
+    NativeDiagnostics nativeDiag {};
+    bool     cppcPccOff {false};
+    bool     nativePending {false}, nativeBusy {false}, nativeStopped {false}, nativeWake {false};
+    uint32_t nativeIntervalMs {50};
+    int32_t  lpmMode {-1};               // -1 auto (native), 0 off, 1 on
 
     IOWorkLoop         *workLoop {nullptr};
     IOCommandGate      *gate {nullptr};
@@ -161,12 +201,11 @@ private:
     // ---- governor sampling (timerFired). With the idle hook active the legacy
     // governor runs on the hook's per-CPU idle accounting and needs no IPI unless a
     // request changes; otherwise it samples APERF/MPERF on every CPU each tick.
-    zen::idle::CpuIdleSnap *idleSnapPrev {nullptr}, *idleSnapCur {nullptr};
-    uint64_t idleSnapTsc {0};
-    bool     idleSnapValid {false};
+    zen::IdleSnapshot *idleSnapPrev {nullptr}, *idleSnapCur {nullptr};
+    bool     idleSnapValid {false};       // false forces all per-CPU baselines to re-prime
     uint32_t govIdleSampling {1};         // GovIdleSampling / amdzen.govidle (atomic)
-    bool     govFromIdle {false};         // the last tick decided from idle accounting
-    bool     perfFresh {false};           // rawPrev holds the previous tick's sample
+    zen::GovSampleSource govSource {zen::kGovSampleHold};
+    bool     perfFresh {false};           // real APERF sample at the preceding dynamic tick
     bool     reqDirty {false};            // a governor request is not written yet
     uint64_t rendezvousCount {0}, rendezvousPrev {0}, rendezvousPrevNs {0};
     uint64_t rendezvousRate {0};          // CPU-wide IPI rounds per second
@@ -192,6 +231,7 @@ private:
     uint64_t idleDeepRate {0}, idleShallowRate {0};
     uint32_t idleAllDeepPermille {0};     // every CPU in CC6 at once
     uint64_t idleAllDeepRate {0}, idleVetoRate {0};
+    uint64_t idleMonitorWakeRate {0}, idleTimerMigrateRate {0};
     uint64_t pmgtMisc {0};                // C001_0292 (PC6En = bit 32)
     bool     havePmgtMisc {false};
 };

@@ -471,6 +471,110 @@ TEST(residency_and_rates)
     CHECK_U64(ratePerSecond(40000000000ull, 4000000000ull), 10000000000ull);
 }
 
+TEST(latency_and_timers)
+{
+    // Bus stall delay (e.g., 10 us from USB/NVMe) must NOT veto Zen per-core CC6 (18 us).
+    CHECK(idleLatencyAllowsDeep(0, 10000, 18000));
+    CHECK(idleLatencyAllowsDeep(18000, 5000, 18000));
+    CHECK(idleLatencyAllowsDeep(50000, 1, 18000));
+    // Interrupt wake latency tighter than CC6 exit latency still vetoes CC6.
+    CHECK(!idleLatencyAllowsDeep(10000, 0, 18000));
+    CHECK(!idleLatencyAllowsDeep(17999, 100000, 18000));
+    CHECK(idleLatencyAllowsDeep(0, 0, 18000));
+
+    // Timer migration: never CPU 0, never absent/EndOfAllTime/expired, only [100us, 5ms).
+    const uint64_t now = 1000000000ull;
+    CHECK(!idleShouldMigrateTimer(0, now, now + 500000));
+    CHECK(!idleShouldMigrateTimer(1, now, 0));
+    CHECK(!idleShouldMigrateTimer(1, now, UINT64_MAX));
+    CHECK(!idleShouldMigrateTimer(1, now, now));
+    CHECK(!idleShouldMigrateTimer(1, now, now - 1000));
+    CHECK(!idleShouldMigrateTimer(1, now, now + 99999));
+    CHECK(idleShouldMigrateTimer(1, now, now + 100000));
+    CHECK(idleShouldMigrateTimer(7, now, now + 4999999));
+    CHECK(!idleShouldMigrateTimer(7, now, now + 5000000));
+
+    // Timer deadline gating CC6 entry.
+    CHECK(idleTimerAllowsDeep(now, 0, 50000));
+    CHECK(idleTimerAllowsDeep(now, UINT64_MAX, 50000));
+    CHECK(!idleTimerAllowsDeep(now, now, 50000));
+    CHECK(!idleTimerAllowsDeep(now, now + 49999, 50000));
+    CHECK(idleTimerAllowsDeep(now, now + 50000, 50000));
+    CHECK(idleTimerAllowsDeep(now, now + 1000000, 50000));
+}
+
+TEST(monitor_wake_protocol)
+{
+    uint32_t st = kMonRunning;
+    CHECK(idleTryMonitorWake(&st));                 // running/CC6 -> needs IPI
+    CHECK_EQ(st, kMonRunning);
+
+    st = kMonArmed;
+    CHECK(!idleTryMonitorWake(&st));                // MWAIT armed -> store wakes, no IPI
+    CHECK_EQ(st, kMonWoken);
+    CHECK(!idleTryMonitorWake(&st));                // already woken -> still no IPI
+    CHECK_EQ(st, kMonWoken);
+}
+
+TEST(preferred_core_ordering)
+{
+    // Simulate 5700X 8c/16t: Cores 6 & 7 are 196, Core 0 is 191, Core 2 is 166.
+    const uint16_t primary[8] = {0, 2, 4, 6, 8, 10, 12, 14};
+    uint16_t coreOf[16];
+    for (uint16_t c = 0; c < 16; ++c) coreOf[c] = c / 2;
+    const uint16_t ranks[8] = {191, 176, 166, 186, 171, 181, 196, 196};
+
+    PreferredCoreTable tbl{};
+    buildPreferredCoreOrder(primary, coreOf, ranks, 16, 8, &tbl);
+    CHECK_EQ(tbl.count, 8u);
+    CHECK_EQ(tbl.primaryCpu[0], 12u);               // 196 (Core 6)
+    CHECK_EQ(tbl.primaryCpu[1], 14u);               // 196 (Core 7)
+    CHECK_EQ(tbl.primaryCpu[2], 0u);                // 191 (Core 0)
+    CHECK_EQ(tbl.primaryCpu[3], 6u);                // 186 (Core 3)
+    CHECK_EQ(tbl.primaryCpu[4], 10u);               // 181 (Core 5)
+    CHECK_EQ(tbl.primaryCpu[5], 2u);                // 176 (Core 1)
+    CHECK_EQ(tbl.primaryCpu[6], 8u);                // 171 (Core 4)
+    CHECK_EQ(tbl.primaryCpu[7], 4u);                // 166 (Core 2)
+    CHECK_EQ(tbl.siblingOfCpu[12], 13u);
+    CHECK_EQ(tbl.siblingOfCpu[13], 12u);
+
+    bool idle[16];
+    bool shallow[16];
+    for (int i = 0; i < 16; ++i) { idle[i] = true; shallow[i] = false; }
+    auto isIdle = [&](uint32_t c) { return idle[c]; };
+    auto isShallow = [&](uint32_t c) { return shallow[c]; };
+
+    // New thread (-1) lands on gold Core 6 (CPU 12).
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, -1, isIdle, isShallow), 12);
+    // If Core 6's SMT sibling (CPU 13) is busy, skip Core 6 and pick gold Core 7 (CPU 14).
+    idle[13] = false;
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, -1, isIdle, isShallow), 14);
+    idle[13] = true;
+    // Thread waking from deep CC6 on Core 2 (rank 166) redirects to gold Core 6 (196).
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, 4, isIdle, isShallow), 12);
+    // Thread waking from shallow MWAIT C1 on Core 2 (166) returns to idle gold Core 6 (196).
+    shallow[4] = true;
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, 4, isIdle, isShallow), 12);
+    // If both gold cores (12, 14) are busy, keep warm MWAIT C1 on Core 2 rather than jumping to 191.
+    idle[12] = false; idle[14] = false;
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, 4, isIdle, isShallow), 4);
+    idle[12] = true; idle[14] = true;
+    // Thread already warm in shallow MWAIT C1 on gold Core 7 (196) keeps warm cache on CPU 14.
+    shallow[4] = false; shallow[14] = true;
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, 14, isIdle, isShallow), 14);
+    shallow[14] = false;
+    // Thread already on gold Core 7 (196) does not migrate to equal-rank Core 6 (196).
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, 14, isIdle, isShallow), 14);
+    // Respects [startCpu, endCpu] subset.
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 11, -1, isIdle, isShallow), 0);
+
+    // Equal ranks across all cores disables steering.
+    const uint16_t flat[8] = {166, 166, 166, 166, 166, 166, 166, 166};
+    buildPreferredCoreOrder(primary, coreOf, flat, 16, 8, &tbl);
+    CHECK_EQ(tbl.count, 0u);
+    CHECK_EQ(choosePreferredCpu(tbl, 16, 0, 15, 4, isIdle, isShallow), 4);
+}
+
 int main()
 {
     for (int i = 0; i < g_ntests; ++i) {

@@ -62,6 +62,7 @@ enum AMDZenBackend {
     kAMDZenBackendNone    = 0, // no control possible (monitor only)
     kAMDZenBackendLegacy  = 1, // HW P-states via MSR C001_0062 + HWCR.CpbDis
     kAMDZenBackendCppcMsr = 2, // CPPC MSRs C001_02B0..B4 (CPUID 8000_0008 EBX[27])
+    kAMDZenBackendCppcPcc = 3, // autonomous ACPI CPPC through a serialized PCC channel
 };
 
 // Why control is disabled (AMDZenInfo.controlBlockReason)
@@ -71,6 +72,7 @@ enum AMDZenBlockReason {
     kAMDZenBlockConflict      = 2, // another AMD PM kext (AMDRyzenCPUPowerManagement, SMCAMDProcessor...) is loaded
     kAMDZenBlockUnsupported   = 3, // CPU has no usable control interface
     kAMDZenBlockHypervisor    = 4, // running under a hypervisor (CPUID 1 ECX[31])
+    kAMDZenBlockPccFailed     = 5, // CPPC may be enabled; quarantine writes until reset
 };
 
 // Feature bits (AMDZenInfo.features)

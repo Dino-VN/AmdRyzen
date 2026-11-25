@@ -200,16 +200,113 @@ static inline uint64_t idleClampTicks(uint64_t thresholdTicks) {
 }
 // Latency requests (ml_set_maxintdelay / ml_set_maxbusdelay, i.e. IOService
 // requireMaxInterruptDelay / requireMaxBusStall; abs time = ns on x86). A request
-// of 0 means "no constraint". CC6 is allowed only if every active request
-// tolerates its exit latency; otherwise the hook stays in C1.
+// of 0 means "no constraint". On AMD Zen, CC6 is a per-core state that flushes
+// L1/L2 on entry and disconnects from coherency probes, so DMA/bus-master traffic
+// does not stall waiting for a CC6 core (matching Linux acpi_idle C2 and XCPM,
+// which routes maxBusDelay to uncore LTR rather than core C-state gating). Only
+// interrupt wake latency (maxIntDelayNs) constrains CC6 entry.
 constexpr uint32_t kIdleDeepLatencyDefaultUs = 100;   // no _CST latency: be conservative
 static inline bool idleLatencyAllowsDeep(uint64_t maxIntDelayNs, uint64_t maxBusDelayNs,
                                          uint64_t deepLatencyNs) {
-    return (maxIntDelayNs == 0 || maxIntDelayNs >= deepLatencyNs) &&
-           (maxBusDelayNs == 0 || maxBusDelayNs >= deepLatencyNs);
+    (void)maxBusDelayNs;
+    return maxIntDelayNs == 0 || maxIntDelayNs >= deepLatencyNs;
 }
 // Exit latency (us) of the _CST entry the hook uses; the default when unknown.
 uint32_t idleDeepLatencyUs(const CstEntry *cst, uint32_t n, int32_t cstIndex);
+
+// Timer-deadline awareness & non-boot timer migration (mirrors XCPM's _xcpm_idle).
+// Only migrate non-boot CPUs' timers whose remaining time lies in [minNs, maxNs):
+// avoids moving timers about to fire immediately while consolidating medium timers
+// onto CPU 0 so secondary cores stay in CC6 longer.
+constexpr uint64_t kIdleTimerMigrateMinNs = 100000ull;   // 100 us
+constexpr uint64_t kIdleTimerMigrateMaxNs = 5000000ull;  // 5 ms
+static inline bool idleShouldMigrateTimer(uint32_t cpu, uint64_t nowNs, uint64_t deadlineNs,
+                                          uint64_t minNs = kIdleTimerMigrateMinNs,
+                                          uint64_t maxNs = kIdleTimerMigrateMaxNs) {
+    if (cpu == 0 || deadlineNs == 0 || deadlineNs == UINT64_MAX || deadlineNs <= nowNs)
+        return false;
+    const uint64_t rem = deadlineNs - nowNs;
+    return rem >= minNs && rem < maxNs;
+}
+static inline bool idleTimerAllowsDeep(uint64_t nowNs, uint64_t deadlineNs,
+                                       uint64_t thresholdNs) {
+    if (deadlineNs == 0 || deadlineNs == UINT64_MAX) return true;
+    if (deadlineNs <= nowNs) return false;
+    return (deadlineNs - nowNs) >= thresholdNs;
+}
+
+// MWAIT monitor-write wakeup protocol (exitIdle / pmCPUExitIdle).
+// 0 = running / HLT / CC6 (requires LAPIC IPI); 1 = armed in MONITOR/MWAIT C1
+// (store wakes target with no IPI); 2 = already woken by monitor store.
+enum MonitorState : uint32_t {
+    kMonRunning = 0,
+    kMonArmed   = 1,
+    kMonWoken   = 2,
+};
+// Called by exitIdle on the waking CPU. Returns true if an IPI is still required;
+// returns false if a monitor-write woke (or already woke) the target CPU.
+static inline bool idleTryMonitorWake(uint32_t *state) {
+    uint32_t cur = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+    if (cur == kMonWoken) return false;
+    if (cur != kMonArmed) return true;
+    if (__atomic_compare_exchange_n(state, &cur, (uint32_t)kMonWoken, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return false;
+    return cur != kMonWoken;
+}
+
+// CPPC Preferred Core ranking for pmChooseCPU.
+constexpr uint32_t kPrefMaxCpus  = 256;
+constexpr uint32_t kPrefMaxCores = 128;
+struct PreferredCoreTable {
+    uint32_t count;                     // 0 when disabled or all cores have equal rank
+    uint16_t primaryCpu[kPrefMaxCores]; // primary logical CPU per core, sorted by rank desc
+    uint16_t siblingOfCpu[kPrefMaxCpus];// SMT sibling logical CPU, or 0xFFFF if none
+    uint16_t rankOfCpu[kPrefMaxCpus];   // CPPC highest perf rank of each logical CPU
+};
+void buildPreferredCoreOrder(const uint16_t *primaryOfCore, const uint16_t *coreOfCpu,
+                             const uint16_t *rankOfCore, uint32_t ncpu, uint32_t ncores,
+                             PreferredCoreTable *out);
+
+// Select the highest-ranked completely-idle primary CPU in [startCpu, endCpu].
+// Preserves cache warmth when preferredCpu is in shallow MWAIT C1 AND already
+// at top rank (or no strictly higher-ranked core is completely idle). When a
+// workload was bumped to a weaker core and a higher-ranked core is idle, or
+// when preferredCpu == -1 / in deep CC6 (L1/L2 flushed), steers to the top core.
+template <typename IsIdleFn, typename IsShallowFn>
+static inline int choosePreferredCpu(const PreferredCoreTable &tbl, uint32_t ncpu,
+                                     int startCpu, int endCpu, int preferredCpu,
+                                     IsIdleFn isIdle, IsShallowFn isShallow) {
+    if (tbl.count == 0 || ncpu == 0 || startCpu < 0 || endCpu < startCpu)
+        return preferredCpu;
+    const uint32_t lo = (uint32_t)startCpu;
+    const uint32_t hi = (uint32_t)endCpu < ncpu ? (uint32_t)endCpu : ncpu - 1;
+    if (lo > hi) return preferredCpu;
+    const bool hasPref = preferredCpu >= 0 && (uint32_t)preferredCpu < ncpu;
+    const uint16_t prefRank = hasPref ? tbl.rankOfCpu[(uint32_t)preferredCpu] : 0;
+    const uint16_t topRank = tbl.primaryCpu[0] < ncpu ? tbl.rankOfCpu[tbl.primaryCpu[0]] : 0;
+    // Keep warm MWAIT C1 threads on top-ranked cores (avoids unnecessary L2 thrash
+    // on rapid ping-pong between gold cores), while allowing weaker cores to
+    // return to an idle gold core.
+    if (hasPref && isShallow((uint32_t)preferredCpu) && prefRank >= topRank)
+        return preferredCpu;
+    for (uint32_t i = 0; i < tbl.count; ++i) {
+        const uint32_t cand = tbl.primaryCpu[i];
+        if (cand >= ncpu) continue;
+        // Table is sorted by descending rank: once we reach <= prefRank, no better core exists.
+        if (hasPref && tbl.rankOfCpu[cand] <= prefRank)
+            return preferredCpu;
+        if (cand < lo || cand > hi) continue;
+        if (!isIdle(cand)) continue;
+        const uint32_t sib = tbl.siblingOfCpu[cand];
+        if (sib < ncpu && !isIdle(sib)) continue;
+        // If preferredCpu is warm in shallow C1, only pull it onto a top-tier gold core.
+        if (hasPref && isShallow((uint32_t)preferredCpu) && tbl.rankOfCpu[cand] < topRank)
+            return preferredCpu;
+        return (int)cand;
+    }
+    return preferredCpu;
+}
 
 // All-cores-in-CC6 accounting. The CPU whose deep entry made every CPU deep stamps
 // `start`; the first CPU to leave adds exit - start. A stamp is only trusted if it
@@ -228,6 +325,8 @@ struct IdleTotals {
     uint64_t deepEntries, shallowEntries;
     uint64_t allDeepTicks, allDeepEvents;   // every CPU in CC6 at once (package-C6 window)
     uint64_t latencyVetoes;                 // deep predicted but a latency request forbade CC6
+    uint64_t monitorWakes;                  // exitIdle monitor-write wakeups (IPI avoided)
+    uint64_t timerMigrates;                 // non-boot timers migrated to CPU 0
 };
 // sum(ticks) * 1000 / (ncpu * intervalTicks), capped at 1000; 0 if the interval is empty.
 uint32_t residencyPermille(uint64_t ticks, uint32_t ncpu, uint64_t intervalTicks);
@@ -235,14 +334,44 @@ uint32_t residencyPermille(uint64_t ticks, uint32_t ncpu, uint64_t intervalTicks
 uint64_t ratePerSecond(uint64_t delta, uint64_t intervalNs);
 
 // ------------------------------------------------------------------ governor sampling
-// Idle time of one CPU accounted up to TSC `now`: the closed idle periods plus the
-// open one (entered at `since`) while the CPU is still inside the hook.
-static inline uint64_t idleAccumulated(uint64_t closedTicks, bool inIdle, uint64_t since, uint64_t now) {
-    return closedTicks + ((inIdle && now > since) ? now - since : 0);
-}
-// Busy share of a window from two idle accumulations: 1000 - idle * 1000 / window,
-// with the idle delta clamped to [0, window]. 1000 if the window is empty.
+// One coherent CPU observation, including its OWN observation time (not a common
+// cutoff captured before scanning CPUs). Invalid observations must not be used as
+// counters or baselines. entries counts exits; zero new exits is not invalid:
+// unchanged idleAcc means busy, while an open idle period keeps idleAcc advancing.
+struct IdleSnapshot {
+    uint64_t idleAcc;
+    uint64_t entries;
+    uint64_t tsc;
+    bool     valid;
+};
+enum IdleSampleStatus : int32_t {
+    kIdleSampleInvalid = -1,
+    kIdleSamplePrimed  = 0,
+    kIdleSampleReady   = 1,
+};
+struct IdleWindow {
+    IdleSampleStatus status;
+    uint32_t busyPermille;    // meaningful only when status == kIdleSampleReady
+};
+// Consume exactly one observation. A failed read invalidates the baseline (never
+// bridges a missing window). A coherent endpoint after a counter/clock regression
+// re-primes it, but that delta is rejected. reset excludes sleep/source changes.
+IdleWindow idleWindowAdvance(IdleSnapshot *baseline, const IdleSnapshot &cur, bool reset);
+// Integer busy share; malformed/empty windows return 1000, not an idle estimate.
 uint32_t idleWindowBusyPermille(uint64_t prevAcc, uint64_t curAcc, uint64_t windowTicks);
+
+// Timer source handoff, shared with host regression tests. perfLastTick means a
+// real APERF sample at the preceding DYNAMIC tick, not the last telemetry sample.
+// A missing sample clears freshness even if the raw counter buffer is retained.
+// Hold does not update governor history or lower a request on unknown input.
+enum GovSampleSource : uint32_t { kGovSampleHold = 0, kGovSampleIdle, kGovSamplePerf };
+struct GovSamplePlan {
+    GovSampleSource source;
+    bool samplePerf;
+    bool nextPerfFresh;       // caller also verifies the sampling round answered
+};
+GovSamplePlan planGovernorSample(bool dynamic, bool reset, bool idleReady, bool telemetry,
+                                 bool perfLastTick, bool havePerf);
 
 } // namespace zen
 

@@ -1,0 +1,10 @@
+# DERIVED/SANITIZED PCCT; NOT an original firmware table.
+# Physical addresses and OEM metadata replaced; ACPI checksum recomputed.
+# Checksum detects corruption only; it is not authentication/signing.
+50 43 43 54 6e 00 00 00 02 7a 4c 41 42 20 20 20
+44 45 52 49 56 45 44 20 01 00 00 00 4c 41 42 20
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 3e 00 00 00 00 00 00 00 00 10 00 00 00 00 00
+00 00 01 00 00 00 00 00 00 40 00 04 00 00 20 00
+00 00 00 00 00 00 00 00 ff ff ff ff 01 00 00 00
+00 00 00 00 a0 0f 00 00 60 ea 00 00 00 00

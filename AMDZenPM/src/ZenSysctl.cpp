@@ -126,6 +126,7 @@ int sysctlInfoString SYSCTL_HANDLER_ARGS {
         switch (in->backend) {
         case kAMDZenBackendLegacy:  str = "legacy"; break;
         case kAMDZenBackendCppcMsr: str = "cppc-msr"; break;
+        case kAMDZenBackendCppcPcc: str = "cppc-pcc"; break;
         default:                    str = "none"; break;
         }
     } else {
@@ -135,6 +136,7 @@ int sysctlInfoString SYSCTL_HANDLER_ARGS {
         case kAMDZenBlockConflict:    str = "conflict"; break;
         case kAMDZenBlockUnsupported: str = "unsupported"; break;
         case kAMDZenBlockHypervisor:  str = "hypervisor"; break;
+        case kAMDZenBlockPccFailed:   str = "pcc-failed"; break;
         default:                      break;
         }
     }
@@ -161,6 +163,69 @@ int sysctlGovernor SYSCTL_HANDLER_ARGS {
 
 enum IntField { kIntBoost, kIntEpp, kIntLimitFast, kIntLimitSlow, kIntUser, kIntPeriod,
                 kIntIdleMode, kIntIdleThreshold };
+
+enum NativeField {
+    kNativeCommands, kNativeLatency, kNativeError, kNativeState,
+    kNativeHighest, kNativeNominal, kNativeNonlinear, kNativeLowest,
+    kNativeMin, kNativeMax, kNativeEpp, kNativeRequests,
+    kNativeAc, kNativeThermal, kNativeLpm, kNativeRt, kNativeRtMask, kNativeHook
+};
+int sysctlNative SYSCTL_HANDLER_ARGS {
+    PmRef ref;
+    if (!ref.pm) return ENXIO;
+    int err = 0;
+    auto *d = copyNew<AMDZenPM::NativeDiagnostics, &AMDZenPM::copyNativeDiagnostics>(ref.pm, &err);
+    if (!d) return err;
+    uint64_t wide = 0;
+    uint32_t value = 0;
+    const char *str = nullptr;
+    switch (arg2) {
+    case kNativeCommands: wide = d->commands; break;
+    case kNativeLatency: wide = d->latencyUs; break;
+    case kNativeRtMask: wide = d->rtMask; break;
+    case kNativeError: value = d->error; break;
+    case kNativeHighest: value = d->caps.highest; break;
+    case kNativeNominal: value = d->caps.nominal; break;
+    case kNativeNonlinear: value = d->caps.lowestNonlinear; break;
+    case kNativeLowest: value = d->caps.lowest; break;
+    case kNativeMin: value = d->requests[0].minPerf; break;
+    case kNativeMax: value = d->requests[0].maxPerf; break;
+    case kNativeEpp: value = d->requests[0].epp; break;
+    case kNativeThermal: value = d->thermal; break;
+    case kNativeRt: value = d->rtActive; break;
+    case kNativeHook: value = d->hookActive; break;
+    case kNativeAc: str = d->acPower == 1 ? "ac" : (d->acPower == 2 ? "battery" : "unknown"); break;
+    case kNativeLpm: str = d->lowPower == 1 ? "off" : (d->lowPower == 2 ? "on" : "unknown"); break;
+    case kNativeState: {
+        static const char *const states[] = {"idle", "starting", "active", "degraded", "fallback", "stopped"};
+        str = d->stage < 6 ? states[d->stage] : "unknown";
+        break;
+    }
+    case kNativeRequests: {
+        constexpr size_t bytes = 8192;
+        char *summary = static_cast<char *>(IOMallocZero(bytes));
+        if (!summary) { freeCopy(d); return ENOMEM; }
+        size_t used = 0;
+        for (uint32_t c = 0; c < d->cpuCount && c < 64; ++c) {
+            const auto &r = d->requests[c];
+            int n = snprintf(summary + used, bytes - used, "%s%u:min=%u,max=%u,desired=%u,epp=%u",
+                             c ? "; " : "", c, r.minPerf, r.maxPerf, r.desiredPerf, r.epp);
+            if (n < 0 || (size_t)n >= bytes - used) break;
+            used += (size_t)n;
+        }
+        err = SYSCTL_OUT(req, summary, used + 1);
+        IOFree(summary, bytes);
+        freeCopy(d);
+        return err;
+    }
+    default: freeCopy(d); return EINVAL;
+    }
+    freeCopy(d);
+    if (str) return SYSCTL_OUT(req, str, strlen(str) + 1);
+    if (arg2 == kNativeCommands || arg2 == kNativeLatency || arg2 == kNativeRtMask)
+        return SYSCTL_OUT(req, &wide, sizeof(wide));
+    return SYSCTL_OUT(req, &value, sizeof(value));
+}
 
 // kern.amdzen.idle_mode / idle_threshold_us. Kept apart from sysctlInt: they do not
 // need a telemetry sample (and must work before the first one exists).
@@ -189,6 +254,18 @@ int sysctlGovKnob SYSCTL_HANDLER_ARGS {
     if (err || !req->newptr) return err;
     if (nv < 0) return EINVAL;
     return ioReturnToErrno(pm->setGovKnob((uint32_t)arg2, (uint32_t)nv));
+}
+
+// kern.amdzen.lpm: -1 auto (native signal), 0 off, 1 on.
+int sysctlLpm SYSCTL_HANDLER_ARGS {
+    PmRef ref;
+    AMDZenPM *pm = ref.pm;
+    if (!pm) return ENXIO;
+    int nv = (int)pm->getLowPowerMode();
+    int err = sysctl_handle_int(oidp, &nv, 0, req);
+    if (err || !req->newptr) return err;
+    if (nv < -1 || nv > 1) return EINVAL;
+    return ioReturnToErrno(pm->setLowPowerMode((int32_t)nv));
 }
 
 int sysctlInt SYSCTL_HANDLER_ARGS {
@@ -260,6 +337,7 @@ int sysctlInt SYSCTL_HANDLER_ARGS {
 #define RO_INT  (CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED)
 #define RW_INT  (CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED)
 #define RO_STR  (CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED)
+#define RO_U64  (CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED)
 #define RW_STR  (CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED)
 
 #define ZEN_CAT2(a, b) a##b
@@ -292,6 +370,25 @@ ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, fast_up_pct,    RW_INT, nullptr, AMDZenPM::k
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, gov_idle_sampling, RW_INT, nullptr, AMDZenPM::kKnobGovIdleSampling, sysctlGovKnob, "I", "1: legacy governor samples load from the idle hook (no IPI); 0: APERF/MPERF rendezvous every tick");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, idle_mode,      RW_INT, nullptr, kIntIdleMode,     sysctlIdle,        "I", "Idle hook: 0 off(HLT) 1 HLT 2 MWAIT 3 CC6 (clamped to hardware); -1 = not registered");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, idle_threshold_us, RW_INT, nullptr, kIntIdleThreshold, sysctlIdle,     "I", "Predicted idle length (us) above which CC6 is used (0..1000000)");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, pcc_commands, RO_U64, nullptr, kNativeCommands, sysctlNative, "QU", "Completed/issued PCC doorbells, including READs");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, pcc_latency_us, RO_U64, nullptr, kNativeLatency, sysctlNative, "QU", "Last PCC command latency (us)");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, pcc_last_error, RO_INT, nullptr, kNativeError, sysctlNative, "I", "ZenPccModel Error, or 65536 policy/65537 confirmation/65538 interrupted");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, pcc_state, RO_STR, nullptr, kNativeState, sysctlNative, "A", "PCC lifecycle state");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_highest, RO_INT, nullptr, kNativeHighest, sysctlNative, "I", "CPU0 Highest Performance");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_nominal, RO_INT, nullptr, kNativeNominal, sysctlNative, "I", "CPU0 Nominal Performance");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_lowest_nonlinear, RO_INT, nullptr, kNativeNonlinear, sysctlNative, "I", "CPU0 Lowest Nonlinear Performance");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_lowest, RO_INT, nullptr, kNativeLowest, sysctlNative, "I", "CPU0 Lowest Performance");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_min, RO_INT, nullptr, kNativeMin, sysctlNative, "I", "CPU0 last accepted minimum request");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_max, RO_INT, nullptr, kNativeMax, sysctlNative, "I", "CPU0 last accepted maximum request");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_epp, RO_INT, nullptr, kNativeEpp, sysctlNative, "I", "CPU0 last accepted native EPP");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, cppc_requests, RO_STR, nullptr, kNativeRequests, sysctlNative, "A", "Per-XNU-CPU last accepted min/max/desired/EPP requests");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_ac_power, RO_STR, nullptr, kNativeAc, sysctlNative, "A", "Native power source: unknown/ac/battery");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_thermal, RO_INT, nullptr, kNativeThermal, sysctlNative, "I", "Native thermal: 0 unknown, 1 nominal, 2 moderate, 3 heavy, 4 critical, 5 emergency");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_low_power_mode, RO_STR, nullptr, kNativeLpm, sysctlNative, "A", "Native low power mode: unknown/off/on");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, lpm, RW_INT, nullptr, 0, sysctlLpm, "I", "Low power mode override: -1 auto, 0 off, 1 on");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_rt_active, RO_INT, nullptr, kNativeRt, sysctlNative, "I", "CPUs with current/recent RT urgency (100 ms hold)");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_rt_mask, RO_U64, nullptr, kNativeRtMask, sysctlNative, "QU", "Per-XNU-CPU current/recent RT urgency mask");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_urgency_active, RO_INT, nullptr, kNativeHook, sysctlNative, "I", "Scheduler urgency observer installed");
 
 static struct sysctl_oid *const kZenOids[] = {
     &ZEN_OID(tctl_mc), &ZEN_OID(tdie_mc), &ZEN_OID(pkg_power_mw), &ZEN_OID(cores_power_mw),
@@ -299,6 +396,11 @@ static struct sysctl_oid *const kZenOids[] = {
     &ZEN_OID(backend), &ZEN_OID(block_reason), &ZEN_OID(governor), &ZEN_OID(boost), &ZEN_OID(epp),
     &ZEN_OID(limit_fast), &ZEN_OID(limit_slow), &ZEN_OID(user_pstate), &ZEN_OID(period_ms),
     &ZEN_OID(idle_mode), &ZEN_OID(idle_threshold_us), &ZEN_OID(fast_up_pct), &ZEN_OID(gov_idle_sampling),
+    &ZEN_OID(pcc_commands), &ZEN_OID(pcc_latency_us), &ZEN_OID(pcc_last_error), &ZEN_OID(pcc_state),
+    &ZEN_OID(cppc_highest), &ZEN_OID(cppc_nominal), &ZEN_OID(cppc_lowest_nonlinear), &ZEN_OID(cppc_lowest),
+    &ZEN_OID(cppc_min), &ZEN_OID(cppc_max), &ZEN_OID(cppc_epp), &ZEN_OID(cppc_requests),
+    &ZEN_OID(native_ac_power), &ZEN_OID(native_thermal), &ZEN_OID(native_low_power_mode), &ZEN_OID(lpm),
+    &ZEN_OID(native_rt_active), &ZEN_OID(native_rt_mask), &ZEN_OID(native_urgency_active),
 };
 
 void AMDZenPM::registerSysctls() {

@@ -16,6 +16,7 @@
 #include "AMDZenShared.h"
 #include "ZenModel.hpp"
 #include "ZenIdleModel.hpp"
+#include "ZenRegs.h"
 
 namespace zen {
 
@@ -57,6 +58,7 @@ enum : uint32_t {
     kOpCppcEnable     = 1u << 4, // write CPPC_ENABLE = 1
     kOpHwcrModify     = 1u << 5, // HWCR = (HWCR & ~hwcrClear) | hwcrSet
     kOpWritePStateDef = 1u << 6, // PStateDef[defIndex] = defValue on every CPU
+    kOpRestoreBootBoost = 1u << 7, // restore each CPU's own boot CpbDis (legacy only)
 };
 
 struct Topology {
@@ -106,9 +108,14 @@ public:
     // Cached values from discover()/last writes
     uint64_t cppcReqInitial(uint32_t cpu) const { return cpu < AMDZEN_MAX_CPUS ? cppcReqBoot[cpu] : 0; }
     uint64_t hwcrInitial() const { return hwcrBoot; }
+    bool bootBoostDisabled(uint32_t cpu) const {
+        return cpu >= topology.ncpu || (hwcrCpuBoot[cpu] & HWCR_CPB_DIS) != 0;
+    }
     void invalidateWriteCache();   // after wake: force next writes
     // CPUs that did not answer the last discover() rendezvous (not yet running).
     uint32_t missingCpus() const { return missing; }
+    bool canPrepareAutonomous() const; // legacy P0/HWCR validated on every CPU, CPB supported
+    bool prepareAutonomous(const bool *enabled, const bool *boostOn, uint32_t ncpu);
 
 private:
     Topology topology;
@@ -119,6 +126,7 @@ private:
     uint32_t okMsr {0};          // ZenHW.cpp-internal: MSRs validated on all CPUs (kOk* bits)
     uint32_t pstateMax {0};      // PstateMaxVal (C001_0061[6:4]) found by discover()
     uint64_t hwcrBoot {0};
+    uint64_t hwcrCpuBoot[AMDZEN_MAX_CPUS] {}; // per-thread boot state, before any control write
     uint32_t missing {0};
     uint64_t cppcReqBoot[AMDZEN_MAX_CPUS] {};
     // write caches (last value written / read) per CPU; UINT64_MAX = unknown
