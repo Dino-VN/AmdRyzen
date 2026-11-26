@@ -11,6 +11,10 @@
 //                                     conservative|userspace|active|none
 //               amdzen.boost=0|1      force Core Performance Boost off/on (default: keep)
 //               amdzen.epp=0..255     CPPC EPP for "active"
+//               amdzen.ac=-1|0|1      AC power override (-1 auto, 0 battery, 1 AC)
+//               amdzen.lpm=-1|0|1     Low Power Mode override (-1 auto, 0 off, 1 on)
+//               amdzen.thermal=0..3   thermal cap mode (0 off, 1 macOS, 2 Tdie, 3 auto)
+//               amdzen.profile=<name> auto|desktop|mobile-perf|mobile-eco|workstation
 //               amdzen.period=<ms>    governor period
 //               amdzen.force=1        control even if a conflicting PM kext is loaded
 //               amdzen.pstatewrite=1  allow P-state definition editing (user client)
@@ -78,6 +82,12 @@ public:
     uint32_t getGovKnob(uint32_t which);
     IOReturn setLowPowerMode(int32_t mode); // -1 auto, 0 off, 1 on
     int32_t  getLowPowerMode();
+    IOReturn setAcPowerMode(int32_t mode);  // -1 auto, 0 battery, 1 ac
+    int32_t  getAcPowerMode();
+    IOReturn setThermalCapMode(uint32_t mode); // 0 off, 1 macos, 2 tdie, 3 auto
+    uint32_t getThermalCapMode();
+    IOReturn setProfile(uint32_t profile);
+    void     getProfile(uint32_t *requested, uint32_t *active);
 
     // Internal diagnostics, outside the stable shared/user-client ABI. Copies
     // are gated; the PCC worker publishes only after each completed operation.
@@ -138,6 +148,9 @@ private:
     void     nativeResume();             // gate-held wake; permanent revocation stays set
     void     nativeDrainCommands();      // outside gate; drains at most one admitted command
     void     nativeNudge();              // gate-held: snap back to 50 ms on config change
+    bool     nativeStepCppcMsr();        // gate-held: ZenNativePolicy step for cppc-msr active mode
+    void     nativeResetMsr();           // gate-held: reset cppc-msr native policy/idle baselines
+    bool     nativeLegacyPowerSave();    // gate-held: true when legacy backend is on battery or LPM
     static bool nativeEnableMayBe();     // boot latch, also consulted by ALL legacy control
     static bool nativeRecordEnable();    // persistent registry latch + permanent module pin
     bool     nativePrepareHardware(const bool *enabled, const bool *boostOn, uint32_t ncpu);
@@ -152,6 +165,13 @@ private:
     bool     nativePending {false}, nativeBusy {false}, nativeStopped {false}, nativeWake {false};
     uint32_t nativeIntervalMs {50};
     int32_t  lpmMode {-1};               // -1 auto (native), 0 off, 1 on
+    int32_t  acPowerMode {-1};           // -1 auto (native), 0 battery, 1 ac
+    uint32_t thermalCapMode {3};         // 0 off, 1 macos, 2 tdie, 3 auto
+    uint32_t profileRequested {0};       // zennative::CpuProfile (0 = auto)
+    uint32_t profileActive {1};          // resolved concrete profile (default desktop)
+    bool     eppExplicit {false};
+    bool     idleThresholdExplicit {false};
+    int32_t  lastTdie_mC {0};            // latest SMN Tdie for Tdie-based thermal cap
 
     IOWorkLoop         *workLoop {nullptr};
     IOCommandGate      *gate {nullptr};

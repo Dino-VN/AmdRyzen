@@ -159,10 +159,10 @@ TEST(identify_misc)
     CHECK_EQ(i.defaultTjMax_mC, 0);
     CHECK(identify(kVendorAMD, 0x19, 0x50, "AMD Ryzen 7 5700G with Radeon Graphics", &i));
     CHECK_STR(i.codename, "Cezanne");
-    CHECK_EQ(i.sviCoreAddr, 0x6F038); CHECK_EQ(i.ccdOffset, 0x154);
+    CHECK_EQ(i.sviCoreAddr, 0x6F038); CHECK_EQ(i.ccdOffset, 0x154); CHECK_EQ(i.defaultTjMax_mC, 95000);
     CHECK(identify(kVendorAMD, 0x19, 0x44, "", &i));
     CHECK_STR(i.codename, "Rembrandt");
-    CHECK_EQ(i.ccdOffset, 0x300); CHECK_EQ(i.sviCoreAddr, 0); CHECK(!i.sviVidFormula);   // SVI3
+    CHECK_EQ(i.ccdOffset, 0x300); CHECK_EQ(i.sviCoreAddr, 0); CHECK(!i.sviVidFormula); CHECK_EQ(i.defaultTjMax_mC, 95000);   // SVI3
     CHECK(identify(kVendorAMD, 0x19, 0x61, "AMD Ryzen 9 7950X 16-Core Processor", &i));
     CHECK_STR(i.codename, "Raphael");
     CHECK_EQ(i.zenGeneration, 4); CHECK_EQ(i.ccdOffset, 0x308); CHECK(!i.sviVidFormula);
@@ -171,7 +171,7 @@ TEST(identify_misc)
     CHECK_STR(i.codename, "Genoa");
     CHECK_EQ(i.ccdOffset, 0x300); CHECK_EQ(i.maxCcds, 12);
     CHECK(identify(kVendorAMD, 0x19, 0x74, "", &i));
-    CHECK_STR(i.codename, "Phoenix"); CHECK_EQ(i.ccdOffset, 0x308);
+    CHECK_STR(i.codename, "Phoenix"); CHECK_EQ(i.ccdOffset, 0x308); CHECK_EQ(i.defaultTjMax_mC, 95000);
     CHECK(identify(kVendorAMD, 0x1A, 0x02, "AMD EPYC 9755 128-Core Processor", &i));
     CHECK_STR(i.codename, "Turin");
     CHECK_EQ(i.ccdOffset, 0x1F0); CHECK_EQ(i.maxCcds, 16);

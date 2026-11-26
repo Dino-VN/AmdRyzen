@@ -264,7 +264,7 @@ void sviMapFor(uint32_t family, uint32_t model, CpuModelInfo *o)
             o->sviCoreAddr = SMN_SVI_PLANE_C; o->sviSocAddr = SMN_SVI_PLANE_B;
         } else if (model == 0x21) {
             o->sviCoreAddr = SMN_SVI_PLANE_B; o->sviSocAddr = SMN_SVI_PLANE_A;
-        } else if (model == 0x50) {
+        } else if (inRange(model, 0x50, 0x5F)) {
             o->sviCoreAddr = SMN_SVI_APU_CORE; o->sviSocAddr = SMN_SVI_APU_SOC;
         } else {
             return;
@@ -285,9 +285,17 @@ uint32_t defaultTjMaxFor(Vendor vendor, uint32_t family, uint32_t model, uint32_
     case 2:
         return 95000;                             // Zen1 / Zen+ / Zen2
     case 3:
-        return (family == 0x19 && inRange(model, 0x20, 0x2F)) ? 90000 : 0;   // Vermeer desktop
+        if (family == 0x19) {
+            if (inRange(model, 0x20, 0x2F))
+                return 90000;                     // Vermeer desktop
+            if (inRange(model, 0x40, 0x5F))
+                return 95000;                     // Rembrandt / Cezanne / Barcelo mobile APU
+        }
+        return 0;
     case 4:
-        return (family == 0x19 && inRange(model, 0x60, 0x6F)) ? 95000 : 0;   // Raphael desktop
+        if (family == 0x19 && inRange(model, 0x60, 0x7F))
+            return 95000;                         // Raphael desktop / Phoenix mobile APU
+        return 0;
     case 5:
         return 95000;
     default:

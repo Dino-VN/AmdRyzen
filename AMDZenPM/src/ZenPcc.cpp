@@ -144,6 +144,7 @@ Error tables(Descriptor &descriptor, Madt &madt, ProcessorNames &names) {
     if (dictionary && it && dictionary->getCount() && dictionary->getCount() <= 128) {
         error = Error::Ok;
         uint32_t total = 0;
+        uint32_t fallbackCount = 0;
         while (OSObject *keyObject = it->getNextObject()) {
             const OSSymbol *key = OSDynamicCast(OSSymbol, keyObject);
             OSData *data = key ? OSDynamicCast(OSData, dictionary->getObject(key)) : nullptr;
@@ -160,9 +161,16 @@ Error tables(Descriptor &descriptor, Madt &madt, ProcessorNames &names) {
             } else if (signature(b, "SSDT") && !memcmp(b.data + 16, "CPUSSDT", 7)) {
                 if (++processorCount != 1) { error = Error::DuplicateIdentity; break; }
                 error = parseProcessorSsdt(b, names);
+            } else if (signature(b, "SSDT") && processorCount == 0) {
+                // Non-AGESA OEM boards/laptops may name the processor SSDT differently
+                // (e.g. "CpuSsdt", "AmdTabl"). Accept it only if strictly parseable
+                // as a \_PR_ Processor() table and unique. Reuse `names` to keep the
+                // kernel stack frame tiny.
+                if (parseProcessorSsdt(b, names) == Error::Ok) ++fallbackCount;
             }
             if (error != Error::Ok) break;
         }
+        if (error == Error::Ok && processorCount == 0 && fallbackCount != 1) names.count = 0;
         if (error == Error::Ok && (pcctCount != 1 || madtCount != 1)) error = Error::AcpiTables;
     }
     OSSafeReleaseNULL(it);

@@ -62,6 +62,26 @@ inline bool restrictRequest(zencppc::Request &r, const DomainBounds &b,
     return r.desiredPerf == 0 && r.epp <= 255;
 }
 
+inline bool fixedGovernorRequests(bool performanceMode, const zennative::Topology &top,
+                                  const zencppc::Caps *caps, const bool *bootDisabled,
+                                  int32_t boost, uint32_t floor, uint32_t ceiling,
+                                  zencppc::Request *out, bool *boostOnOut = nullptr) {
+    if (!out || !caps || !top.cpuCount || top.cpuCount > zennative::kMaxCpus) return false;
+    for (uint32_t c = 0; c < top.cpuCount; ++c) {
+        DomainBounds b {};
+        if (!domainBounds(top, caps, bootDisabled, boost, c, b)) return false;
+        const uint32_t lnl = (caps[c].lowestNonlinear >= b.lowest && caps[c].lowestNonlinear <= b.nominal)
+            ? caps[c].lowestNonlinear : b.lowest;
+        zencppc::Request r = performanceMode
+            ? zencppc::Request {b.nominal, b.highest, 0, 0x00}
+            : zencppc::Request {b.lowest, lnl, 0, 0xFF};
+        if (!restrictRequest(r, b, floor, ceiling)) return false;
+        out[c] = r;
+        if (boostOnOut) boostOnOut[c] = b.boostOn;
+    }
+    return true;
+}
+
 struct PrerequisitePlan { uint64_t ctl, hwcr; };
 inline bool planPrerequisites(bool enabled, bool boostOn, uint64_t ctl, uint64_t hwcr,
                               PrerequisitePlan &out) {

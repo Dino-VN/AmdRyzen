@@ -47,10 +47,20 @@ bool boolProperty(IOService *service, const char *key, bool &value) {
 void poll(SignalState &s) {
     discover(s);
     SystemSignals next = unknownSystem();
-    // No documented kernel LPM setting/notification exists in this SDK, and
-    // no LPM/energy-mode property is published on this MacPro7,1. "Low Power
-    // Sleep" and kern.lowpowerwake describe sleep, not Low Power Mode.
+    // Probe IOPMrootDomain for Low Power Mode (published on macOS 12+ laptops/Macs
+    // when supported). Absence or unexpected type safely leaves lowPowerMode unknown.
     if (s.root) {
+        bool lpm = false;
+        if (boolProperty(s.root, "LowPowerMode", lpm)) {
+            next.lowPowerMode = lpm ? kOn : kOff;
+        } else {
+            OSObject *lpObj = s.root->copyProperty("LowPowerMode");
+            if (OSNumber *lpNum = OSDynamicCast(OSNumber, lpObj)) {
+                const uint64_t lv = lpNum->unsigned64BitValue();
+                if (lv <= 1) next.lowPowerMode = lv ? kOn : kOff;
+            }
+            if (lpObj) lpObj->release();
+        }
         OSObject *property = s.root->copyProperty(kIOPMRootDomainPowerStatusKey);
         OSDictionary *status = OSDynamicCast(OSDictionary, property);
         OSNumber *warning = status ? OSDynamicCast(OSNumber, status->getObject(kIOPMThermalLevelWarningKey)) : nullptr;

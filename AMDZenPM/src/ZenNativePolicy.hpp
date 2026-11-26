@@ -13,6 +13,20 @@ enum ThermalLevel : uint32_t {
     kThermalCritical, kThermalEmergency
 };
 enum PowerSource : uint32_t { kPowerUnknown = 0, kPowerExternal, kPowerInternal };
+enum ThermalCapMode : uint32_t {
+    kThermalCapOff = 0,    // ignore macOS and Tdie caps (rely on hardware PB2/PROCHOT)
+    kThermalCapMacOs = 1,  // follow IOPMrootDomain thermal warnings only
+    kThermalCapTdie = 2,   // follow real CPU Tdie vs TjMax only (immune to fake SMBIOS)
+    kThermalCapAuto = 3,   // prefer real Tdie vs TjMax when available, else macOS warning
+};
+enum CpuProfile : uint32_t {
+    kProfileAuto = 0,       // auto-selected from CPU family/model/brand/cores
+    kProfileDesktop = 1,    // mainstream desktop (65-170W)
+    kProfileMobilePerf = 2, // performance laptop APU (H/HS/HX, 35-55W+)
+    kProfileMobileEco = 3,  // thin-and-light laptop APU (U/e/low-power, 15-28W)
+    kProfileWorkstation = 4,// Threadripper / EPYC / >=24 cores
+    kProfileCount = 5,
+};
 enum PowerEvidence : uint32_t {
     kPowerUnobserved = 0, kPowerRootAggressiveness, kPowerSourceProperty, kPowerPlatformProperty
 };
@@ -40,8 +54,17 @@ struct Tunables {
     uint32_t rtFloorBusyThreshold;   // permille (default 250) required before RT pins minPerf when busyObserved
 };
 Tunables defaultTunables();
+CpuProfile detectCpuProfile(uint32_t family, uint32_t model, const char *brand, uint32_t physicalCores);
+Tunables tunablesForProfile(CpuProfile profile);
+uint32_t recommendedIdleThresholdUs(CpuProfile profile);
+const char *profileName(CpuProfile profile);
+bool profileFromName(const char *name, CpuProfile &out);
 bool validCaps(const zencppc::Caps &caps);
 ThermalLevel decodeThermalWarning(uint32_t raw);
+ThermalLevel thermalFromTdie(int32_t tdie_mC, uint32_t tjMax_mC, ThermalLevel prev);
+SystemSignals resolveSystemSignals(const SystemSignals &raw, int32_t acOverride,
+                                   int32_t lpmOverride, uint32_t thermalMode,
+                                   ThermalLevel tdieLevel);
 zencppc::Request decide(const CpuSnapshot &cpu, bool recentRT, bool recentForeground,
                        const SystemSignals &system, const zencppc::Caps &caps,
                        const Tunables &tunables);

@@ -180,6 +180,49 @@ static void lpmAndAdaptiveInterval(){
     REQUIRE(s.nativeIntervalMs==200);
     s.nativeNudge();REQUIRE(s.nativeIntervalMs==50);
 }
+static void fixedGovernorsAndMsrNative(){
+    hw.boostDisabled[0]=hw.boostDisabled[1]=false;
+    Service s;s.boot();
+    // Fixed performance and powersave governors work on cppc-pcc.
+    s.governor=kAMDZenGovPerformance;s.tick();
+    REQUIRE(s.nativeDiag.requests[0].minPerf==136 && s.nativeDiag.requests[0].maxPerf==150 && s.nativeDiag.requests[0].epp==0);
+    s.governor=kAMDZenGovPowersave;s.tick();
+    REQUIRE(s.nativeDiag.requests[0].minPerf==40 && s.nativeDiag.requests[0].maxPerf==82 && s.nativeDiag.requests[0].epp==255);
+    // Back to active with Tdie thermal cap + AC override on fake SMBIOS.
+    s.governor=kAMDZenGovCppcActive;s.info->tjMax_mC=95000;s.lastTdie_mC=55000;
+    s.native->signals.system={zennative::kOff,zennative::kThermalHeavy,zennative::kPowerInternal,zennative::kPowerPlatformProperty,100};
+    s.acPowerMode=1;s.thermalCapMode=zennative::kThermalCapAuto;s.tick();
+    REQUIRE(s.nativeDiag.acPower==zennative::kPowerExternal);
+    REQUIRE(s.nativeDiag.thermal==zennative::kThermalNominal);
+    REQUIRE(s.nativeDiag.requests[0].maxPerf==150);
+    // Real overheat (92 C on 95 C TjMax) triggers Heavy thermal cap even if macOS says nominal.
+    s.native->signals.system.thermal=zennative::kThermalNominal;
+    s.lastTdie_mC=92000;s.tick();
+    REQUIRE(s.nativeDiag.thermal==zennative::kThermalHeavy);
+    REQUIRE(s.nativeDiag.requests[0].maxPerf<150);
+    s.stopNative();
+
+    // Separate cppc-msr laptop path: mobile-eco profile + battery vs AC + LPM without PCC.
+    rebootFixture();
+    hw.boostDisabled[0]=hw.boostDisabled[1]=false;
+    Service msr;msr.nativePending=false;msr.backend=kAMDZenBackendCppcMsr;msr.governor=kAMDZenGovCppcActive;
+    msr.limitFast=0;msr.limitSlow=0;
+    msr.info->cppcHighest=196;msr.info->cppcEffectiveHighest=166;msr.info->cppcNominal=120;
+    msr.info->cppcLowestNonlinear=55;msr.info->cppcLowest=20;msr.info->tjMax_mC=95000;
+    msr.profileActive=zennative::kProfileMobileEco;msr.acPowerMode=0;msr.lastTdie_mC=50000;
+    msr.reqDirty=false;
+    REQUIRE(msr.nativeStepCppcMsr());
+    REQUIRE(msr.reqDirty);
+    REQUIRE(msr.nativeDiag.requests[0].epp==192); // mobile-eco batteryEpp
+    REQUIRE(msr.nativeDiag.requests[0].maxPerf==166);
+    msr.lpmMode=1;msr.reqDirty=false;reviewNow+=100000000ull;
+    REQUIRE(msr.nativeStepCppcMsr());
+    REQUIRE(msr.reqDirty);
+    REQUIRE(msr.nativeDiag.requests[0].epp==240 && msr.nativeDiag.requests[0].maxPerf==120);
+    REQUIRE(msr.nativeLegacyPowerSave());
+    msr.lpmMode=0;msr.acPowerMode=1;
+    REQUIRE(!msr.nativeLegacyPowerSave());
+}
 int main(){
     const struct {const char *name;void(*run)();} tests[]={
         {"replacement service retains quarantine",replacement},{"registry survives simulated module reload",persistentReload},
@@ -200,7 +243,8 @@ int main(){
         {"stop never writes on revoked Channel",stopQuarantine},{"module pin failure blocks enable",pinFailure},
         {"registry latch failure blocks enable",registryFailure},{"pure admission / domain / prerequisite rules",pureRules},
         {"enable timeout never falls back",enableTimeout},{"enable preflight intent stays quarantined",enablePreflightFailure},
-        {"preferred cores, LPM override and adaptive idle interval",lpmAndAdaptiveInterval}
+        {"preferred cores, LPM override and adaptive idle interval",lpmAndAdaptiveInterval},
+        {"fixed governors, Tdie thermal immunity and cppc-msr native step",fixedGovernorsAndMsrNative}
     };
     for(const auto &t:tests){rebootFixture();t.run();++cases;printf("PASS %s\n",t.name);}
     printf("Native integration: %u tests, %u checks, 0 failures (ASan/UBSan)\n",cases,unsigned(integrationChecks)+assertions);

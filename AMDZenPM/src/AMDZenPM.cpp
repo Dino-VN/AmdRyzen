@@ -9,6 +9,7 @@
 #include "AMDZenPM.hpp"
 #include "ZenRegs.h"
 #include "ZenIdle.hpp"
+#include "ZenNativePolicy.hpp"
 #include "ZenPccModel.hpp"
 #include "XnuPrivate.h"
 
@@ -23,7 +24,7 @@
 #include <kern/task.h>
 #include <string.h>
 
-#define AMDZEN_KEXT_VERSION "0.0.1"
+#define AMDZEN_KEXT_VERSION "0.0.2"
 #define LOG(fmt, ...) IOLog("AMDZenPM: " fmt "\n", ##__VA_ARGS__)
 
 OSDefineMetaClassAndStructors(AMDZenPM, IOService)
@@ -55,6 +56,9 @@ enum GateOp : uint32_t {
     kGateSetIdleThreshold, // a1 = microseconds
     kGateSetGovKnob,       // a1 = GovKnob, a2 = value
     kGateSetLpm,           // a1 = (intptr_t)-1 / 0 / 1
+    kGateSetAcPower,       // a1 = (intptr_t)-1 / 0 / 1
+    kGateSetThermalCap,    // a1 = ThermalCapMode (0..3)
+    kGateSetProfile,       // a1 = CpuProfile (0..4)
 };
 
 const char *const kConflictClasses[] = {
@@ -343,7 +347,10 @@ void AMDZenPM::loadConfig() {
         if (readBoostMode(o, &bm)) boostMode = bm;
     }
     uint32_t v;
-    if (readU32(getProperty("EPP"), &v) && v <= 255) epp = v;
+    if (readU32(getProperty("EPP"), &v) && v <= 255) {
+        epp = v;
+        if (v != 128) eppExplicit = true;
+    }
     if (readU32(getProperty("GovernorPeriodMs"), &v))   governorPeriodMs = clampU(v, 4, 1000);
     if (readU32(getProperty("TelemetryPeriodMs"), &v))  telemetryPeriodMs = clampU(v, 100, 10000);
     if (readU32(getProperty("UpThreshold"), &v))        tun.upThreshold = clampU(v, 1, 100);
@@ -369,7 +376,25 @@ void AMDZenPM::loadConfig() {
         if (ok) idleRequest = m;
         else LOG("invalid IdleMode ignored (auto|0|1|2|3)");
     }
-    if (readU32(getProperty("IdleThresholdUs"), &v)) idleThresholdUs = minU(v, zen::kIdleThresholdMaxUs);
+    if (readU32(getProperty("IdleThresholdUs"), &v)) {
+        idleThresholdUs = minU(v, zen::kIdleThresholdMaxUs);
+        if (idleThresholdUs != zen::kIdleThresholdDefaultUs) idleThresholdExplicit = true;
+    }
+    if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("ACPower"))) {
+        int32_t m = (int32_t)n->unsigned32BitValue();
+        if (m >= -1 && m <= 1) acPowerMode = m;
+    }
+    if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("LowPowerMode"))) {
+        int32_t m = (int32_t)n->unsigned32BitValue();
+        if (m >= -1 && m <= 1) lpmMode = m;
+    }
+    if (readU32(getProperty("ThermalCap"), &v) && v <= zennative::kThermalCapAuto)
+        thermalCapMode = v;
+    if (OSString *s = OSDynamicCast(OSString, getProperty("Profile"))) {
+        zennative::CpuProfile p = zennative::kProfileAuto;
+        if (zennative::profileFromName(s->getCStringNoCopy(), p)) profileRequested = (uint32_t)p;
+        else LOG("unknown Profile '%s', using auto", s->getCStringNoCopy());
+    }
 
     // ---- boot-args (highest priority)
     int flag = 0;
@@ -387,9 +412,27 @@ void AMDZenPM::loadConfig() {
             else LOG("unknown amdzen.gov='%s' ignored", buf);
         }
     }
+    char pb[32] = {};
+    if (PE_parse_boot_arg_str("amdzen.profile", pb, sizeof(pb))) {
+        pb[sizeof(pb) - 1] = '\0';
+        zennative::CpuProfile p = zennative::kProfileAuto;
+        if (zennative::profileFromName(pb, p)) profileRequested = (uint32_t)p;
+        else LOG("unknown amdzen.profile='%s' ignored", pb);
+    }
     int32_t iv = 0;
     if (PE_parse_boot_argn("amdzen.boost", &iv, sizeof(iv))) boostMode = iv ? 1 : 0;
-    if (PE_parse_boot_argn("amdzen.epp", &iv, sizeof(iv)) && iv >= 0 && iv <= 255) epp = (uint32_t)iv;
+    if (PE_parse_boot_argn("amdzen.epp", &iv, sizeof(iv)) && iv >= 0 && iv <= 255) {
+        epp = (uint32_t)iv;
+        eppExplicit = true;
+    }
+    iv = -2;
+    if (PE_parse_boot_argn("amdzen.ac", &iv, sizeof(iv)) && iv >= -1 && iv <= 1) acPowerMode = iv;
+    iv = -2;
+    if (PE_parse_boot_argn("amdzen.lpm", &iv, sizeof(iv)) && iv >= -1 && iv <= 1) lpmMode = iv;
+    iv = -1;
+    if (PE_parse_boot_argn("amdzen.thermal", &iv, sizeof(iv)) && iv >= 0 && iv <= (int32_t)zennative::kThermalCapAuto)
+        thermalCapMode = (uint32_t)iv;
+    iv = 0;
     if (PE_parse_boot_argn("amdzen.period", &iv, sizeof(iv)) && iv > 0) governorPeriodMs = clampU((uint32_t)iv, 4, 1000);
     iv = -1;
     if (PE_parse_boot_argn("amdzen.fastup", &iv, sizeof(iv)) && iv >= 0) tun.fastUpPct = minU((uint32_t)iv, 100);
@@ -654,6 +697,18 @@ bool AMDZenPM::tryInitHardware() {
 
     chooseBackend();
 
+    // ---- resolve per-CPU power profile (independent of fake SMBIOS)
+    {
+        const zennative::CpuProfile detected = zennative::detectCpuProfile(
+            info->family, info->model, info->brand, info->physicalCores);
+        const zennative::CpuProfile eff = (profileRequested == zennative::kProfileAuto)
+            ? detected : static_cast<zennative::CpuProfile>(profileRequested);
+        __atomic_store_n(&profileActive, static_cast<uint32_t>(eff), __ATOMIC_RELAXED);
+        if (!eppExplicit) epp = zennative::tunablesForProfile(eff).baseEpp;
+        if (!idleThresholdExplicit)
+            __atomic_store_n(&idleThresholdUs, zennative::recommendedIdleThresholdUs(eff), __ATOMIC_RELAXED);
+    }
+
     // ---- static info that discover() does not own
     info->abiVersion = AMDZEN_ABI_VERSION;
     info->structSize = sizeof(AMDZenInfo);
@@ -705,8 +760,9 @@ bool AMDZenPM::tryInitHardware() {
 
     publishProperties();
     const uint32_t gov = (blockReason || backend == kAMDZenBackendNone) ? (uint32_t)kAMDZenGovNone : governor;
-    LOG("%s (%s, fam %02xh model %02xh) %u CPUs/%u cores, backend %s, governor %s, block %s",
+    LOG("%s (%s, fam %02xh model %02xh) %u CPUs/%u cores, profile %s, backend %s, governor %s, block %s",
         info->brand, model.codename, info->family, info->model, tp.ncpu, tp.ncores,
+        zennative::profileName(static_cast<zennative::CpuProfile>(profileActive)),
         backendName(backend), zen::governorName(gov), blockReasonName(blockReason));
     return true;
 }
@@ -765,6 +821,7 @@ void AMDZenPM::applyPolicy(bool force) {
     if (force) {
         memset(govState, 0, sizeof(zen::GovState) * AMDZEN_MAX_CORES);
         resetGovernorSampling();
+        nativeResetMsr();
     }
 
     // Boost (HWCR.CpbDis on every thread)
@@ -874,13 +931,15 @@ void AMDZenPM::timerFired(IOTimerEventSource *src) {
     const bool nativePath = nativePending || backend == kAMDZenBackendCppcPcc;
     const uint32_t gov = (blockReason || backend == kAMDZenBackendNone) ? (uint32_t)kAMDZenGovNone : governor;
     const bool control = !nativeEnableMayBe() && !nativePath && gov != kAMDZenGovNone;
+    const bool msrNative = control && backend == kAMDZenBackendCppcMsr &&
+        gov == kAMDZenGovCppcActive && gCppcEnabled;
     const bool dyn = control && isDynamicGov(gov);
     const bool prime = rebaseEnergy;
     const uint64_t telNs = (uint64_t)telemetryPeriodMs * 1000000ull;
     const uint64_t halfGovNs = (uint64_t)governorPeriodMs * 500000ull;
 
-    bool doTel = prime || (!nativePath && !dyn) || lastTelemetryNs == 0 ||
-        (now - lastTelemetryNs) + (nativePath ? 0 : halfGovNs) >= telNs;
+    bool doTel = prime || (!nativePath && !msrNative && !dyn) || lastTelemetryNs == 0 ||
+        (now - lastTelemetryNs) + ((nativePath || msrNative) ? 0 : halfGovNs) >= telNs;
 
     uint32_t writeOp = 0;
     if (control) {
@@ -893,6 +952,7 @@ void AMDZenPM::timerFired(IOTimerEventSource *src) {
     // priming/invalid/disabled accounting needs APERF, never the exit count alone.
     // On wake, prime BOTH sources here without deciding across the sleep interval.
     if (prime) resetGovernorSampling();
+    if (msrNative) nativeStepCppcMsr();
     bool idleGov = false;
     if (dyn && writeOp == zen::kOpWritePState &&
         __atomic_load_n(&govIdleSampling, __ATOMIC_RELAXED) && zen::idle::active())
@@ -958,7 +1018,7 @@ void AMDZenPM::timerFired(IOTimerEventSource *src) {
     }
     perfFresh = sampling.nextPerfFresh && perfAnswered;
 
-    src->setTimeoutMS(nativePath ? nativeIntervalMs : (dyn ? governorPeriodMs : telemetryPeriodMs));
+    src->setTimeoutMS((nativePath || msrNative) ? nativeIntervalMs : (dyn ? governorPeriodMs : telemetryPeriodMs));
 }
 
 bool AMDZenPM::governorTick() {
@@ -1028,9 +1088,14 @@ void AMDZenPM::governLegacyCores(const zen::PStateTable &t, const uint16_t *core
     const zen::Topology &tp = cpu.topo();
     const uint32_t ncpu = minU(tp.ncpu, AMDZEN_MAX_CPUS);
     const uint32_t ncores = minU(tp.ncores, AMDZEN_MAX_CORES);
+    zen::GovTunables effTun = tun;
+    if (nativeLegacyPowerSave()) {
+        effTun.fastUpPct = 0;
+        if (effTun.utilHeadroomPct > 110) effTun.utilHeadroomPct = 110;
+    }
     uint8_t idxOfCore[AMDZEN_MAX_CORES];
     for (uint32_t k = 0; k < ncores; k++) {
-        uint32_t idx = zen::governLegacy(governor, tun, t, &govState[k], coreUtil[k], coreBusy[k], userValue);
+        uint32_t idx = zen::governLegacy(governor, effTun, t, &govState[k], coreUtil[k], coreBusy[k], userValue);
         // Never request a disabled / undecodable definition (fall back towards P0).
         idxOfCore[k] = (uint8_t)enabledAtOrFaster(info, minU(idx, AMDZEN_MAX_PSTATES - 1));
     }
@@ -1177,6 +1242,7 @@ void AMDZenPM::telemetryTick(uint64_t nowNs) {
             if (t > -50000 && t < 150000) {
                 s->tctl_mC = t;
                 s->tdie_mC = zen::clampTctl(t - model.tctlOffset_mC, model.dispNegative);
+                __atomic_store_n(&lastTdie_mC, s->tdie_mC, __ATOMIC_RELAXED);
             }
         }
     }
@@ -1242,12 +1308,18 @@ void AMDZenPM::telemetryTick(uint64_t nowNs) {
     const uint32_t gov = (blockReason || backend == kAMDZenBackendNone) ? (uint32_t)kAMDZenGovNone : governor;
     s->governor = gov;
     if (backend == kAMDZenBackendCppcMsr) {
-        bool boostOn = boostMode >= 0 ? boostMode == 1 : !(cpu.hwcrInitial() & HWCR_CPB_DIS);
-        CppcPolicy p = cppcPolicy(info, governor, boostOn, limitFast, limitSlow, epp, userValue,
-                              (uint32_t)((cpu.cppcReqInitial(0) >> 8) & 0xFF));
-        s->limitFast = p.minPerf;
-        s->limitSlow = p.maxPerf;
-        s->epp = (gov != kAMDZenGovNone) ? p.epp : (uint32_t)((cpu.cppcReqInitial(0) >> 24) & 0xFF);
+        if (gov == kAMDZenGovCppcActive) {
+            s->limitFast = limitFast;
+            s->limitSlow = limitSlow;
+            s->epp = epp;
+        } else {
+            bool boostOn = boostMode >= 0 ? boostMode == 1 : !(cpu.hwcrInitial() & HWCR_CPB_DIS);
+            CppcPolicy p = cppcPolicy(info, governor, boostOn, limitFast, limitSlow, epp, userValue,
+                                  (uint32_t)((cpu.cppcReqInitial(0) >> 8) & 0xFF));
+            s->limitFast = p.minPerf;
+            s->limitSlow = p.maxPerf;
+            s->epp = (gov != kAMDZenGovNone) ? p.epp : (uint32_t)((cpu.cppcReqInitial(0) >> 24) & 0xFF);
+        }
     } else if (backend == kAMDZenBackendCppcPcc) {
         // Report user-configured overrides (0 = uncapped/default), not CPU0's current
         // dynamic request (already in cppc_min/cppc_max), so sysctl limit_fast writes
@@ -1316,6 +1388,8 @@ void AMDZenPM::publishProperties() {
             }
             dictNum(d, "PStateMaxVal", info->pstateMaxVal);
             dictNum(d, "TjMax_mC", info->tjMax_mC);
+            dictStr(d, "CPUProfile", zennative::profileName(
+                static_cast<zennative::CpuProfile>(__atomic_load_n(&profileActive, __ATOMIC_RELAXED))));
             dictStr(d, "Backend", backendName(backend));
             dictStr(d, "BlockReason", blockReasonName(blockReason));
             dictNum(d, "BlockReasonCode", blockReason);
@@ -1923,6 +1997,7 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
     case kGateSetIdleThreshold: {
         uint32_t us = (uint32_t)(uintptr_t)a1;
         if (us > zen::kIdleThresholdMaxUs) return kIOReturnBadArgument;
+        self->idleThresholdExplicit = true;
         __atomic_store_n(&self->idleThresholdUs, us, __ATOMIC_RELAXED);   // read lock-free by sysctl
         if (zen::idle::registered())
             zen::idle::setThresholdTicks(zen::usToTscTicks(us, self->cpu.tscHz()),
@@ -1933,7 +2008,44 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
         int32_t m = (int32_t)(intptr_t)a1;
         if (m < -1 || m > 1) return kIOReturnBadArgument;
         __atomic_store_n(&self->lpmMode, m, __ATOMIC_RELAXED);
-        if (self->backend == kAMDZenBackendCppcPcc) self->nativeNudge();
+        if (self->backend == kAMDZenBackendCppcPcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
+        return kIOReturnSuccess;
+    }
+    case kGateSetAcPower: {
+        int32_t m = (int32_t)(intptr_t)a1;
+        if (m < -1 || m > 1) return kIOReturnBadArgument;
+        __atomic_store_n(&self->acPowerMode, m, __ATOMIC_RELAXED);
+        if (self->backend == kAMDZenBackendCppcPcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
+        return kIOReturnSuccess;
+    }
+    case kGateSetThermalCap: {
+        uint32_t m = (uint32_t)(uintptr_t)a1;
+        if (m > zennative::kThermalCapAuto) return kIOReturnBadArgument;
+        __atomic_store_n(&self->thermalCapMode, m, __ATOMIC_RELAXED);
+        if (self->backend == kAMDZenBackendCppcPcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
+        return kIOReturnSuccess;
+    }
+    case kGateSetProfile: {
+        uint32_t req = (uint32_t)(uintptr_t)a1;
+        if (req >= zennative::kProfileCount) return kIOReturnBadArgument;
+        __atomic_store_n(&self->profileRequested, req, __ATOMIC_RELAXED);
+        const zennative::CpuProfile eff = (req == zennative::kProfileAuto)
+            ? zennative::detectCpuProfile(in->family, in->model, in->brand, in->physicalCores)
+            : static_cast<zennative::CpuProfile>(req);
+        __atomic_store_n(&self->profileActive, static_cast<uint32_t>(eff), __ATOMIC_RELAXED);
+        if (!self->eppExplicit) self->epp = zennative::tunablesForProfile(eff).baseEpp;
+        if (!self->idleThresholdExplicit) {
+            const uint32_t us = zennative::recommendedIdleThresholdUs(eff);
+            __atomic_store_n(&self->idleThresholdUs, us, __ATOMIC_RELAXED);
+            if (zen::idle::registered())
+                zen::idle::setThresholdTicks(zen::usToTscTicks(us, self->cpu.tscHz()),
+                                             (uint64_t)us * 1000ull);
+        }
+        self->removeProperty("CPUInfo");
+        self->publishProperties();
+        if (self->backend == kAMDZenBackendCppcPcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
+        LOG("profile -> %s (requested %s)", zennative::profileName(eff),
+            zennative::profileName(static_cast<zennative::CpuProfile>(req)));
         return kIOReturnSuccess;
     }
     default:
@@ -1956,7 +2068,8 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
     case kGateSetGovernor: {
         uint32_t g = (uint32_t)(uintptr_t)a1;
         if (g >= kAMDZenGovCount) return kIOReturnBadArgument;
-        if (pcc && g != kAMDZenGovCppcActive && g != kAMDZenGovNone) return kIOReturnUnsupported;
+        if (pcc && g != kAMDZenGovCppcActive && g != kAMDZenGovPerformance &&
+            g != kAMDZenGovPowersave && g != kAMDZenGovNone) return kIOReturnUnsupported;
         if (g == kAMDZenGovCppcActive && !cppc) return kIOReturnUnsupported;
         if (g == kAMDZenGovNone) {
             self->restoreHardware();
@@ -1966,7 +2079,7 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
             self->governor = g;
             self->applyPolicy(true);
         }
-        if (pcc) self->nativeNudge();
+        if (pcc || (self->backend == kAMDZenBackendCppcMsr && g == kAMDZenGovCppcActive)) self->nativeNudge();
         else if (self->timer && !self->sleeping) self->timer->setTimeoutMS(isDynamicGov(g) ? self->governorPeriodMs : 10);
         LOG("governor -> %s", zen::governorName(g));
         return kIOReturnSuccess;
@@ -1986,7 +2099,7 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
             self->boostMode = m;
             self->applyPolicy(false);
         }
-        if (pcc) self->nativeNudge();
+        if (pcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
         self->setProperty("BoostMode", (unsigned long long)(uint32_t)self->boostMode, 32);
         return kIOReturnSuccess;
     }
@@ -2001,7 +2114,7 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
         self->limitFast = fast;
         self->limitSlow = slow;
         self->applyPolicy(false);
-        if (pcc) self->nativeNudge();
+        if (pcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
         return kIOReturnSuccess;
     }
     case kGateSetEpp: {
@@ -2009,8 +2122,9 @@ IOReturn AMDZenPM::gatedAction(OSObject *owner, void *opArg, void *a1, void *a2,
         if (e > 255) return kIOReturnBadArgument;
         if (!cppc) return kIOReturnUnsupported;
         self->epp = e;
+        self->eppExplicit = true;
         self->applyPolicy(false);
-        if (pcc) self->nativeNudge();
+        if (pcc || self->backend == kAMDZenBackendCppcMsr) self->nativeNudge();
         return kIOReturnSuccess;
     }
     case kGateSetUser: {
@@ -2171,6 +2285,34 @@ int32_t AMDZenPM::getLowPowerMode() {
     return __atomic_load_n(&lpmMode, __ATOMIC_RELAXED);
 }
 
+IOReturn AMDZenPM::setAcPowerMode(int32_t mode) {
+    if (mode < -1 || mode > 1) return kIOReturnBadArgument;
+    return runGated(kGateSetAcPower, (void *)(intptr_t)mode);
+}
+
+int32_t AMDZenPM::getAcPowerMode() {
+    return __atomic_load_n(&acPowerMode, __ATOMIC_RELAXED);
+}
+
+IOReturn AMDZenPM::setThermalCapMode(uint32_t mode) {
+    if (mode > zennative::kThermalCapAuto) return kIOReturnBadArgument;
+    return runGated(kGateSetThermalCap, (void *)(uintptr_t)mode);
+}
+
+uint32_t AMDZenPM::getThermalCapMode() {
+    return __atomic_load_n(&thermalCapMode, __ATOMIC_RELAXED);
+}
+
+IOReturn AMDZenPM::setProfile(uint32_t profile) {
+    if (profile >= zennative::kProfileCount) return kIOReturnBadArgument;
+    return runGated(kGateSetProfile, (void *)(uintptr_t)profile);
+}
+
+void AMDZenPM::getProfile(uint32_t *requested, uint32_t *active) {
+    if (requested) *requested = __atomic_load_n(&profileRequested, __ATOMIC_RELAXED);
+    if (active) *active = __atomic_load_n(&profileActive, __ATOMIC_RELAXED);
+}
+
 void AMDZenPM::getIdleConfig(int32_t *mode, uint32_t *thresholdUs) {
     if (mode) *mode = zen::idle::registered() ? (int32_t)zen::idle::mode() : -1;
     if (thresholdUs) *thresholdUs = __atomic_load_n(&idleThresholdUs, __ATOMIC_RELAXED);
@@ -2223,6 +2365,14 @@ IOReturn AMDZenPM::setProperties(OSObject *properties) {
         note(readU32(o, &v) ? setIdleThresholdUs(v) : kIOReturnBadArgument);
     if (OSObject *o = d->getObject("FastUpPct"))
         note(readU32(o, &v) ? setGovKnob(kKnobFastUpPct, v) : kIOReturnBadArgument);
+    if (OSObject *o = d->getObject("ThermalCap"))
+        note(readU32(o, &v) ? setThermalCapMode(v) : kIOReturnBadArgument);
+    if (OSObject *o = d->getObject("Profile")) {
+        OSString *s = OSDynamicCast(OSString, o);
+        zennative::CpuProfile p = zennative::kProfileAuto;
+        note((s && zennative::profileFromName(s->getCStringNoCopy(), p))
+             ? setProfile((uint32_t)p) : kIOReturnBadArgument);
+    }
     if (OSObject *o = d->getObject("GovIdleSampling")) {
         if (OSBoolean *b = OSDynamicCast(OSBoolean, o)) note(setGovKnob(kKnobGovIdleSampling, b->isTrue() ? 1 : 0));
         else note(readU32(o, &v) ? setGovKnob(kKnobGovIdleSampling, v) : kIOReturnBadArgument);

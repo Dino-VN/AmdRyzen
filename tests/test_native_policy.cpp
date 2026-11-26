@@ -479,6 +479,83 @@ static void randomized_smt_safety_intersection() {
     }
 }
 
+static void tdie_thermal_hysteresis_and_signal_resolution() {
+    // Missing TjMax or non-positive Tdie -> unknown (safe fallback to macOS warning).
+    EQ(thermalFromTdie(0, 95000, kThermalUnknown), kThermalUnknown);
+    EQ(thermalFromTdie(75000, 0, kThermalUnknown), kThermalUnknown);
+
+    // Rising edge on 95 C TjMax: <89 nominal, 89 moderate, 92 heavy, 95 critical, 100 emergency.
+    ThermalLevel th = kThermalUnknown;
+    th = thermalFromTdie(80000, 95000, th); EQ(th, kThermalNominal);
+    th = thermalFromTdie(88999, 95000, th); EQ(th, kThermalNominal);
+    th = thermalFromTdie(89000, 95000, th); EQ(th, kThermalModerate);
+    th = thermalFromTdie(92000, 95000, th); EQ(th, kThermalHeavy);
+    th = thermalFromTdie(95000, 95000, th); EQ(th, kThermalCritical);
+    th = thermalFromTdie(100000, 95000, th); EQ(th, kThermalEmergency);
+
+    // Falling edge uses 3 C hysteresis so clocks do not chatter around a threshold.
+    th = thermalFromTdie(97000, 95000, th); EQ(th, kThermalEmergency); // 100 - 3
+    th = thermalFromTdie(96999, 95000, th); EQ(th, kThermalCritical);
+    th = thermalFromTdie(92000, 95000, th); EQ(th, kThermalCritical);  // 95 - 3
+    th = thermalFromTdie(91999, 95000, th); EQ(th, kThermalHeavy);
+    th = thermalFromTdie(89000, 95000, th); EQ(th, kThermalHeavy);     // 92 - 3
+    th = thermalFromTdie(88999, 95000, th); EQ(th, kThermalModerate);
+    th = thermalFromTdie(86000, 95000, th); EQ(th, kThermalModerate);  // 89 - 3
+    th = thermalFromTdie(85999, 95000, th); EQ(th, kThermalNominal);
+
+    // Desktop spoofing a low-TDP MacBook SMBIOS: fake macOS Heavy warning + battery,
+    // real CPU is cool (55 C) -> auto thermal ignores fake macOS warning, acOverride=1 restores AC.
+    SystemSignals raw {kOff, kThermalHeavy, kPowerInternal, kPowerPlatformProperty, 100};
+    SystemSignals eff = resolveSystemSignals(raw, 1, -1, kThermalCapAuto, kThermalNominal);
+    EQ(eff.powerSource, kPowerExternal);
+    EQ(eff.thermal, kThermalNominal);
+    EQ(eff.lowPowerMode, kOff);
+
+    // Laptop spoofing MacPro7,1 (macOS reports nominal thermal) but real Tdie hits 93 C:
+    SystemSignals laptopRaw {kOff, kThermalNominal, kPowerInternal, kPowerSourceProperty, 0};
+    SystemSignals laptopEff = resolveSystemSignals(laptopRaw, -1, -1, kThermalCapAuto, kThermalHeavy);
+    EQ(laptopEff.powerSource, kPowerInternal);
+    EQ(laptopEff.thermal, kThermalHeavy);
+
+    // Mode 0 (off) disables all thermal capping; mode 1 (macos) forces macOS warning;
+    // mode 3 (auto) falls back to macOS warning when Tdie is unavailable.
+    EQ(resolveSystemSignals(raw, -1, -1, kThermalCapOff, kThermalCritical).thermal, kThermalNominal);
+    EQ(resolveSystemSignals(raw, -1, -1, kThermalCapMacOs, kThermalNominal).thermal, kThermalHeavy);
+    EQ(resolveSystemSignals(raw, -1, -1, kThermalCapAuto, kThermalUnknown).thermal, kThermalHeavy);
+    EQ(resolveSystemSignals(raw, -1, 1, kThermalCapAuto, kThermalNominal).lowPowerMode, kOn);
+}
+
+static void cpu_profile_detection_and_tunables() {
+    EQ(detectCpuProfile(0x19, 0x21, "AMD Ryzen 7 5700X 8-Core Processor", 8), kProfileDesktop);
+    EQ(detectCpuProfile(0x19, 0x50, "AMD Ryzen 7 5700G with Radeon Graphics", 8), kProfileDesktop);
+    EQ(detectCpuProfile(0x19, 0x50, "AMD Ryzen 7 5800U with Radeon Graphics", 8), kProfileMobileEco);
+    EQ(detectCpuProfile(0x19, 0x50, "AMD Ryzen 7 5825U with Radeon Graphics", 8), kProfileMobileEco);
+    EQ(detectCpuProfile(0x19, 0x50, "AMD Ryzen 7 5800H with Radeon Graphics", 8), kProfileMobilePerf);
+    EQ(detectCpuProfile(0x19, 0x74, "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics", 8), kProfileMobilePerf);
+    EQ(detectCpuProfile(0x19, 0x61, "AMD Ryzen 9 7945HX with Radeon Graphics", 16), kProfileMobilePerf);
+    EQ(detectCpuProfile(0x1A, 0x24, "AMD Ryzen AI 9 HX 370 w/ Radeon 890M", 12), kProfileMobilePerf);
+    EQ(detectCpuProfile(0x19, 0x08, "AMD Ryzen Threadripper PRO 5975WX 32-Cores", 32), kProfileWorkstation);
+    EQ(detectCpuProfile(0x19, 0x01, "AMD EPYC 7763 64-Core Processor", 64), kProfileWorkstation);
+
+    const Tunables eco = tunablesForProfile(kProfileMobileEco);
+    const Tunables perf = tunablesForProfile(kProfileMobilePerf);
+    const Tunables desk = tunablesForProfile(kProfileDesktop);
+    const Tunables ws = tunablesForProfile(kProfileWorkstation);
+    CHECK(eco.batteryEpp > desk.batteryEpp);
+    CHECK(perf.batteryEpp > desk.batteryEpp);
+    CHECK(perf.baseEpp < desk.baseEpp);
+    CHECK(ws.busyBoostThreshold >= desk.busyBoostThreshold);
+    EQ(recommendedIdleThresholdUs(kProfileMobileEco), 35u);
+    EQ(recommendedIdleThresholdUs(kProfileDesktop), 50u);
+    EQ(recommendedIdleThresholdUs(kProfileWorkstation), 75u);
+
+    CpuProfile parsed = kProfileAuto;
+    CHECK(profileFromName("mobile-eco", parsed) && parsed == kProfileMobileEco);
+    CHECK(profileFromName("laptop", parsed) && parsed == kProfileMobilePerf);
+    CHECK(profileFromName("workstation", parsed) && parsed == kProfileWorkstation);
+    CHECK(!profileFromName("invalid", parsed));
+}
+
 int main() {
     struct Test { const char *name; void (*run)(); } tests[] = {
 #define TEST(fn) {#fn,fn}
@@ -493,6 +570,8 @@ int main() {
         TEST(realtime_burst_hold_and_relaxation), TEST(rt_between_ticks_and_wrap),
         TEST(foreground_bursts_prevent_background_only), TEST(pending_hysteresis_restarts_on_flap),
         TEST(busy_driven_epp_and_fleeting_rt),
+        TEST(tdie_thermal_hysteresis_and_signal_resolution),
+        TEST(cpu_profile_detection_and_tunables),
         TEST(safety_caps_bypass_relax_hold), TEST(capability_change_respects_bounds),
         TEST(global_batch_rate_and_unchanged_suppression), TEST(retry_reset_and_unobserved_history),
         TEST(stop_rearm_does_not_revive_realtime),

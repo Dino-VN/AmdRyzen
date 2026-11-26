@@ -30,6 +30,160 @@ void observe(CpuHistory &h, const CpuSnapshot &s, uint64_t now) {
 } // namespace
 
 Tunables defaultTunables() { return {128, 32, 192, 224, 160, 80, 100, 100, 100, 50, 450, 0, 250}; }
+
+namespace {
+inline bool hasSub(const char *s, const char *sub) {
+    if (!s || !sub || !*sub) return false;
+    for (; *s; ++s) {
+        const char *a = s, *b = sub;
+        while (*a && *b && *a == *b) { ++a; ++b; }
+        if (!*b) return true;
+    }
+    return false;
+}
+inline bool isDigit(char c) { return c >= '0' && c <= '9'; }
+inline bool isWordEnd(char c) { return c == '\0' || c == ' ' || c == '-' || c == '\t'; }
+// Matches AMD mobile SKU suffixes immediately after model digits: e.g. "5800U", "5825U", "7840HS", "6800H", "7945HX".
+bool hasMobileSuffix(const char *brand, const char *suffix) {
+    if (!brand || !suffix || !*suffix) return false;
+    for (const char *p = brand; *p; ++p) {
+        if (!isDigit(*p)) continue;
+        const char *q = p;
+        while (isDigit(*q)) ++q;
+        if (q - p < 3) { p = q - 1; continue; } // require 3+ digit SKU (e.g. 5800, 7840, 350)
+        const char *a = q, *b = suffix;
+        while (*a && *b && *a == *b) { ++a; ++b; }
+        if (!*b && isWordEnd(*a)) return true;
+        p = q - 1;
+    }
+    return false;
+}
+inline bool isMobileApuModel(uint32_t family, uint32_t model) {
+    if (family == 0x17) {
+        return model == 0x11 || model == 0x18 || model == 0x20 || model == 0x60 ||
+               model == 0x68 || model == 0x90 || model == 0x91 || (model >= 0xA0 && model <= 0xAF);
+    }
+    if (family == 0x19) {
+        return (model >= 0x40 && model <= 0x5F) || (model >= 0x70 && model <= 0x7F);
+    }
+    if (family == 0x1A) {
+        return (model >= 0x20 && model <= 0x2F) || (model >= 0x60 && model <= 0x7F);
+    }
+    return false;
+}
+inline bool eqNoCase(const char *a, const char *b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? char(*a - 'A' + 'a') : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? char(*b - 'A' + 'a') : *b;
+        if (ca != cb) return false;
+        ++a; ++b;
+    }
+    return *a == *b;
+}
+} // namespace
+
+CpuProfile detectCpuProfile(uint32_t family, uint32_t model, const char *brand, uint32_t physicalCores) {
+    if (hasSub(brand, "Threadripper") || hasSub(brand, "EPYC") || physicalCores >= 24)
+        return kProfileWorkstation;
+    if (hasMobileSuffix(brand, "U") || hasMobileSuffix(brand, "C") || hasMobileSuffix(brand, "e") ||
+        (family == 0x17 && (model == 0x20 || model == 0x90 || model == 0x91 ||
+                            (model >= 0xA0 && model <= 0xAF)))) {
+        return kProfileMobileEco;
+    }
+    if (hasMobileSuffix(brand, "HX") || hasMobileSuffix(brand, "HS") || hasMobileSuffix(brand, "H") ||
+        hasSub(brand, "Ryzen AI")) {
+        return kProfileMobilePerf;
+    }
+    // Desktop G/GE/GT APUs (e.g. 5600G, 5700G, 8700G) share silicon with mobile APUs
+    // but run in desktop sockets with desktop cooling/power budgets.
+    if (hasMobileSuffix(brand, "G") || hasMobileSuffix(brand, "GE") || hasMobileSuffix(brand, "GT"))
+        return kProfileDesktop;
+    if (isMobileApuModel(family, model))
+        return kProfileMobilePerf;
+    return kProfileDesktop;
+}
+
+Tunables tunablesForProfile(CpuProfile profile) {
+    Tunables t = defaultTunables();
+    switch (profile) {
+        case kProfileMobileEco:
+            t.baseEpp = 128;
+            t.realtimeEpp = 48;
+            t.backgroundEpp = 224;
+            t.lowPowerEpp = 240;
+            t.batteryEpp = 192;
+            t.realtimeMinPct = 70;
+            t.busyBoostThreshold = 500;
+            t.busyBoostEpp = 16;
+            t.rtFloorBusyThreshold = 300;
+            break;
+        case kProfileMobilePerf:
+            t.baseEpp = 112;
+            t.realtimeEpp = 32;
+            t.backgroundEpp = 208;
+            t.lowPowerEpp = 224;
+            t.batteryEpp = 176;
+            t.realtimeMinPct = 80;
+            t.busyBoostThreshold = 450;
+            t.busyBoostEpp = 0;
+            t.rtFloorBusyThreshold = 250;
+            break;
+        case kProfileWorkstation:
+            t.baseEpp = 112;
+            t.realtimeEpp = 32;
+            t.backgroundEpp = 192;
+            t.lowPowerEpp = 224;
+            t.batteryEpp = 160;
+            t.realtimeMinPct = 80;
+            t.busyBoostThreshold = 500;
+            t.busyBoostEpp = 0;
+            t.rtFloorBusyThreshold = 250;
+            break;
+        case kProfileDesktop:
+        case kProfileAuto:
+        default:
+            break;
+    }
+    return t;
+}
+
+uint32_t recommendedIdleThresholdUs(CpuProfile profile) {
+    switch (profile) {
+        case kProfileMobileEco:   return 35;
+        case kProfileWorkstation: return 75;
+        case kProfileMobilePerf:
+        case kProfileDesktop:
+        case kProfileAuto:
+        default:                  return 50;
+    }
+}
+
+const char *profileName(CpuProfile profile) {
+    switch (profile) {
+        case kProfileAuto:        return "auto";
+        case kProfileDesktop:     return "desktop";
+        case kProfileMobilePerf:  return "mobile-perf";
+        case kProfileMobileEco:   return "mobile-eco";
+        case kProfileWorkstation: return "workstation";
+        default:                  return "unknown";
+    }
+}
+
+bool profileFromName(const char *name, CpuProfile &out) {
+    if (eqNoCase(name, "auto"))        { out = kProfileAuto; return true; }
+    if (eqNoCase(name, "desktop"))     { out = kProfileDesktop; return true; }
+    if (eqNoCase(name, "mobile-perf") || eqNoCase(name, "laptop-perf") || eqNoCase(name, "laptop")) {
+        out = kProfileMobilePerf; return true;
+    }
+    if (eqNoCase(name, "mobile-eco") || eqNoCase(name, "laptop-eco") || eqNoCase(name, "eco")) {
+        out = kProfileMobileEco; return true;
+    }
+    if (eqNoCase(name, "workstation") || eqNoCase(name, "hedt") || eqNoCase(name, "server")) {
+        out = kProfileWorkstation; return true;
+    }
+    return false;
+}
 bool validCaps(const zencppc::Caps &c) {
     return c.lowest != 0 && c.lowest <= c.lowestNonlinear &&
            c.lowestNonlinear <= c.nominal && c.nominal <= c.highest;
@@ -45,6 +199,58 @@ ThermalLevel decodeThermalWarning(uint32_t raw) {
         case 110: return kThermalEmergency;
         default: return kThermalUnknown;
     }
+}
+
+ThermalLevel thermalFromTdie(int32_t tdie_mC, uint32_t tjMax_mC, ThermalLevel prev) {
+    if (tjMax_mC < 50000 || tjMax_mC > 150000 || tdie_mC <= 0) return kThermalUnknown;
+    const int32_t tj = static_cast<int32_t>(tjMax_mC);
+    constexpr int32_t kHyst = 3000;          // 3 C hysteresis to prevent clock oscillation
+    const int32_t thEmerg = tj + 5000;
+    const int32_t thCrit  = tj;
+    const int32_t thHeavy = tj - 3000;
+    const int32_t thMod   = tj - 6000;
+
+    if (tdie_mC >= thEmerg) return kThermalEmergency;
+    if (prev == kThermalEmergency && tdie_mC >= thEmerg - kHyst) return kThermalEmergency;
+
+    if (tdie_mC >= thCrit) return kThermalCritical;
+    if (prev >= kThermalCritical && tdie_mC >= thCrit - kHyst) return kThermalCritical;
+
+    if (tdie_mC >= thHeavy) return kThermalHeavy;
+    if (prev >= kThermalHeavy && tdie_mC >= thHeavy - kHyst) return kThermalHeavy;
+
+    if (tdie_mC >= thMod) return kThermalModerate;
+    if (prev >= kThermalModerate && tdie_mC >= thMod - kHyst) return kThermalModerate;
+
+    return kThermalNominal;
+}
+
+SystemSignals resolveSystemSignals(const SystemSignals &raw, int32_t acOverride,
+                                   int32_t lpmOverride, uint32_t thermalMode,
+                                   ThermalLevel tdieLevel) {
+    SystemSignals out = raw;
+    if (acOverride == 1) out.powerSource = kPowerExternal;
+    else if (acOverride == 0) out.powerSource = kPowerInternal;
+
+    if (lpmOverride == 0) out.lowPowerMode = kOff;
+    else if (lpmOverride == 1) out.lowPowerMode = kOn;
+
+    switch (thermalMode) {
+        case kThermalCapOff:
+            out.thermal = kThermalNominal;
+            break;
+        case kThermalCapMacOs:
+            out.thermal = raw.thermal;
+            break;
+        case kThermalCapTdie:
+            out.thermal = tdieLevel;
+            break;
+        case kThermalCapAuto:
+        default:
+            out.thermal = (tdieLevel != kThermalUnknown) ? tdieLevel : raw.thermal;
+            break;
+    }
+    return out;
 }
 
 zencppc::Request decide(const CpuSnapshot &cpu, bool recentRT, bool recentForeground,

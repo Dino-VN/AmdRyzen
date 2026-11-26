@@ -6,6 +6,7 @@
 // of AMDZenPM, so every hardware access still happens on the driver's work loop.
 //
 #include "AMDZenPM.hpp"
+#include "ZenNativePolicy.hpp"
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
@@ -268,6 +269,47 @@ int sysctlLpm SYSCTL_HANDLER_ARGS {
     return ioReturnToErrno(pm->setLowPowerMode((int32_t)nv));
 }
 
+// kern.amdzen.ac_power: -1 auto (native signal), 0 battery, 1 ac.
+int sysctlAcPower SYSCTL_HANDLER_ARGS {
+    PmRef ref;
+    AMDZenPM *pm = ref.pm;
+    if (!pm) return ENXIO;
+    int nv = (int)pm->getAcPowerMode();
+    int err = sysctl_handle_int(oidp, &nv, 0, req);
+    if (err || !req->newptr) return err;
+    if (nv < -1 || nv > 1) return EINVAL;
+    return ioReturnToErrno(pm->setAcPowerMode((int32_t)nv));
+}
+
+// kern.amdzen.thermal_cap: 0 off, 1 macos, 2 tdie, 3 auto.
+int sysctlThermalCap SYSCTL_HANDLER_ARGS {
+    PmRef ref;
+    AMDZenPM *pm = ref.pm;
+    if (!pm) return ENXIO;
+    int nv = (int)pm->getThermalCapMode();
+    int err = sysctl_handle_int(oidp, &nv, 0, req);
+    if (err || !req->newptr) return err;
+    if (nv < 0 || nv > (int)zennative::kThermalCapAuto) return EINVAL;
+    return ioReturnToErrno(pm->setThermalCapMode((uint32_t)nv));
+}
+
+// kern.amdzen.profile: read active profile; write auto|desktop|mobile-perf|mobile-eco|workstation.
+int sysctlProfile SYSCTL_HANDLER_ARGS {
+    PmRef ref;
+    AMDZenPM *pm = ref.pm;
+    if (!pm) return ENXIO;
+    uint32_t reqProf = 0, actProf = 0;
+    pm->getProfile(&reqProf, &actProf);
+    char buf[32];
+    strlcpy(buf, zennative::profileName(static_cast<zennative::CpuProfile>(actProf)), sizeof(buf));
+    int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+    if (err || !req->newptr) return err;
+    buf[sizeof(buf) - 1] = '\0';
+    zennative::CpuProfile p = zennative::kProfileAuto;
+    if (!zennative::profileFromName(buf, p)) return EINVAL;
+    return ioReturnToErrno(pm->setProfile(static_cast<uint32_t>(p)));
+}
+
 int sysctlInt SYSCTL_HANDLER_ARGS {
     PmRef ref;
     AMDZenPM *pm = ref.pm;
@@ -386,6 +428,9 @@ ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_ac_power, RO_STR, nullptr, kNativeAc,
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_thermal, RO_INT, nullptr, kNativeThermal, sysctlNative, "I", "Native thermal: 0 unknown, 1 nominal, 2 moderate, 3 heavy, 4 critical, 5 emergency");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_low_power_mode, RO_STR, nullptr, kNativeLpm, sysctlNative, "A", "Native low power mode: unknown/off/on");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, lpm, RW_INT, nullptr, 0, sysctlLpm, "I", "Low power mode override: -1 auto, 0 off, 1 on");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, ac_power, RW_INT, nullptr, 0, sysctlAcPower, "I", "AC power override: -1 auto, 0 battery, 1 ac");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, thermal_cap, RW_INT, nullptr, 0, sysctlThermalCap, "I", "Thermal cap mode: 0 off, 1 macos, 2 tdie, 3 auto");
+ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, profile, RW_STR, nullptr, 0, sysctlProfile, "A", "CPU power profile (auto|desktop|mobile-perf|mobile-eco|workstation)");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_rt_active, RO_INT, nullptr, kNativeRt, sysctlNative, "I", "CPUs with current/recent RT urgency (100 ms hold)");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_rt_mask, RO_U64, nullptr, kNativeRtMask, sysctlNative, "QU", "Per-XNU-CPU current/recent RT urgency mask");
 ZEN_SYSCTL_PROC(ZEN_NODE, OID_AUTO, native_urgency_active, RO_INT, nullptr, kNativeHook, sysctlNative, "I", "Scheduler urgency observer installed");
@@ -400,6 +445,7 @@ static struct sysctl_oid *const kZenOids[] = {
     &ZEN_OID(cppc_highest), &ZEN_OID(cppc_nominal), &ZEN_OID(cppc_lowest_nonlinear), &ZEN_OID(cppc_lowest),
     &ZEN_OID(cppc_min), &ZEN_OID(cppc_max), &ZEN_OID(cppc_epp), &ZEN_OID(cppc_requests),
     &ZEN_OID(native_ac_power), &ZEN_OID(native_thermal), &ZEN_OID(native_low_power_mode), &ZEN_OID(lpm),
+    &ZEN_OID(ac_power), &ZEN_OID(thermal_cap), &ZEN_OID(profile),
     &ZEN_OID(native_rt_active), &ZEN_OID(native_rt_mask), &ZEN_OID(native_urgency_active),
 };
 

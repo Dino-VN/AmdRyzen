@@ -107,8 +107,14 @@ struct CPU {
     }
     const Topology &topo() const {return t;}
     bool bootBoostDisabled(uint32_t c) const {return bootDisabled[c];}
+    uint64_t cppcReqInitial(uint32_t) const {return 0;}
 };
 inline uint32_t cppcPerfToFreq(uint32_t p,uint32_t n,uint32_t f) {return n?p*f/n:0;}
+inline uint64_t encodeCppcReq(uint64_t prev,uint32_t maxP,uint32_t minP,uint32_t desP,uint32_t epp) {
+    return (prev & 0xFFFFFFFF00000000ull) | (uint64_t)(maxP & 0xFF) |
+           ((uint64_t)(minP & 0xFF) << 8) | ((uint64_t)(desP & 0xFF) << 16) |
+           ((uint64_t)(epp & 0xFF) << 24);
+}
 namespace idle {
 inline bool nativeSignalsActive(){return true;}
 inline bool active(){return false;}
@@ -130,9 +136,14 @@ public:
     NativeDiagnostics nativeDiag{};
     bool nativePending=true,nativeBusy=false,nativeStopped=false,nativeWake=false,sleeping=false,initialized=true;
     uint32_t nativeIntervalMs=50;
-    int32_t lpmMode=-1;
+    int32_t lpmMode=-1, acPowerMode=-1, lastTdie_mC=0;
+    uint32_t thermalCapMode=zennative::kThermalCapAuto;
+    uint32_t profileRequested=zennative::kProfileAuto, profileActive=zennative::kProfileDesktop;
     uint32_t backend=kAMDZenBackendLegacy, governor=kAMDZenGovSchedutil,blockReason=0,epp=128,limitFast=0,limitSlow=2;
     int32_t boostMode=-1;
+    bool reqDirty=false;
+    uint64_t cppcReqStorage[64]{};
+    uint64_t *cppcReq=cppcReqStorage;
     zen::CPU cpu;
     AMDZenInfo infoStorage{};
     AMDZenInfo *info=&infoStorage;
@@ -160,6 +171,7 @@ public:
     void nativeRestorePreparation() {if(!nativeEnableMayBe())for(unsigned c=0;c<hw.count;++c)hw.boostDisabled[c]=cpu.bootDisabled[c];}
     bool nativeInit(); void nativeFree(); void nativeSchedule(); void nativeDrain(); void nativeStop();
     void nativeCancel(bool permanent=false); void nativeResume(); void nativeDrainCommands(); void nativeNudge();
+    bool nativeStepCppcMsr(); void nativeResetMsr(); bool nativeLegacyPowerSave();
     static bool nativeEnableMayBe(); static bool nativeRecordEnable();
     static void nativeThread(void *,void *);
     static IOReturn nativeGateAction(OSObject *,void *,void *,void *,void *);

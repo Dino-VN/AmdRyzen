@@ -65,12 +65,16 @@ struct AMDZenPM::NativeRuntime {
     uint16_t apic[zenpcc::kMaxCpus] {};
     // Inputs are written under the gate only when no callback is reserved.
     uint32_t baseEpp = 128, fast = 0, slow = 0, gov = kAMDZenGovCppcActive;
-    int32_t boost = -1, preparedBoost = -2, lpm = -1;
+    int32_t boost = -1, preparedBoost = -2, lpm = -1, acOverride = -1, tdie_mC = 0;
+    uint32_t thermalMode = zennative::kThermalCapAuto, tjMax_mC = 0;
+    uint32_t profile = zennative::kProfileDesktop;
     bool boot = false, wake = false, writes = false;
     uint64_t nextTickNs = 0;
     // Worker-owned except prerequisite results, written during its gate action.
     zen::IdleSnapshot idlePrev[zenpcc::kMaxCpus] {}, idleCur[zenpcc::kMaxCpus] {};
     bool idleValid = false;
+    zennative::ThermalLevel tdieThermal = zennative::kThermalUnknown;
+    zennative::SystemSignals effectiveSystem {};
     uint32_t quietTicks = 0;
     bool enabledMayBe = false, ready = false, degraded = false, prepared = false;
     bool previousActive = true;
@@ -142,10 +146,16 @@ struct AMDZenPM::NativeRuntime {
         if (amdzen::neutralRequests(topology, caps, requests)) return true;
         error = kPolicyError; degraded = true; return false;
     }
+    void updateEffectiveSignals() {
+        tdieThermal = zennative::thermalFromTdie(tdie_mC, tjMax_mC, tdieThermal);
+        effectiveSystem = zennative::resolveSystemSignals(
+            signals.system, acOverride, lpm, thermalMode, tdieThermal);
+    }
     bool policyRequests(bool balanced) {
         if (!continuing()) return false;
         const uint64_t nowMs = nowNs() / 1000000;
-        zennative::Tunables t = zennative::defaultTunables();
+        zennative::Tunables t = zennative::tunablesForProfile(
+            static_cast<zennative::CpuProfile>(profile));
         t.baseEpp = baseEpp;
         if (!balanced) {
             zennative::snapshotSignals(signals, nowMs, topology.cpuCount);
@@ -164,9 +174,8 @@ struct AMDZenPM::NativeRuntime {
                 idleValid = false;
             }
         }
-        if (lpm == 0) signals.system.lowPowerMode = zennative::kOff;
-        else if (lpm == 1) signals.system.lowPowerMode = zennative::kOn;
-        const bool ok = zennative::tick(policy, topology, signals.cpus, signals.system,
+        updateEffectiveSignals();
+        const bool ok = zennative::tick(policy, topology, signals.cpus, effectiveSystem,
                                         caps, t, nowMs, result);
         if (!ok) { error = kPolicyError; return false; }
         bool anyBusy = result.changedCount != 0;
@@ -272,6 +281,11 @@ void AMDZenPM::nativeSchedule() {
     r.writes = !blockReason && governor != kAMDZenGovNone;
     r.baseEpp = epp; r.boost = boostMode;
     r.lpm = __atomic_load_n(&lpmMode, __ATOMIC_RELAXED);
+    r.acOverride = __atomic_load_n(&acPowerMode, __ATOMIC_RELAXED);
+    r.thermalMode = __atomic_load_n(&thermalCapMode, __ATOMIC_RELAXED);
+    r.profile = __atomic_load_n(&profileActive, __ATOMIC_RELAXED);
+    r.tdie_mC = __atomic_load_n(&lastTdie_mC, __ATOMIC_RELAXED);
+    r.tjMax_mC = info ? info->tjMax_mC : 0;
     r.fast = nativePending ? 0 : limitFast;
     r.slow = nativePending ? 0 : limitSlow;
     r.gov = governor;
@@ -323,19 +337,40 @@ void AMDZenPM::nativeThread(thread_call_param_t owner, thread_call_param_t) {
         if (ok && needsEnable) ok = r.enable();
         zennative::reset(r.policy);
         r.idleValid = false;
+        r.tdieThermal = zennative::kThermalUnknown;
         r.quietTicks = 0;
         r.signals.polled = false;
-        if (r.continuing()) zennative::snapshotSignals(r.signals, nowNs() / 1000000, r.topology.cpuCount);
+        if (r.continuing()) {
+            zennative::snapshotSignals(r.signals, nowNs() / 1000000, r.topology.cpuCount);
+            r.updateEffectiveSignals();
+        }
         r.degraded |= !ok;
     } else if ((r.ready || r.degraded) && r.continuing()) {
         if (r.degraded || !r.writes) {
             zennative::snapshotSignals(r.signals, nowNs() / 1000000, r.topology.cpuCount);
+            r.updateEffectiveSignals();
             if (!r.degraded && r.gov == kAMDZenGovNone && r.neutral()) {
                 if (self->gate->runAction(nativeGateAction, (void *)kPrepare,
                                           (void *)kNeutralPermission) == kIOReturnSuccess) r.apply();
                 r.previousActive = false;
                 r.idleValid = false;
                 r.quietTicks = 0;
+            }
+        } else if (r.gov == kAMDZenGovPerformance || r.gov == kAMDZenGovPowersave) {
+            r.error = 0;
+            zennative::snapshotSignals(r.signals, nowNs() / 1000000, r.topology.cpuCount);
+            r.updateEffectiveSignals();
+            r.previousActive = false;
+            r.idleValid = false;
+            r.quietTicks = 10;
+            if (amdzen::fixedGovernorRequests(r.gov == kAMDZenGovPerformance, r.topology, r.caps,
+                                              r.bootBoostDisabled, r.boost, r.fast, r.slow,
+                                              r.requests, r.boostOn)) {
+                if (self->gate->runAction(nativeGateAction, (void *)kPrepare,
+                                          (void *)kApplyPrerequisites) == kIOReturnSuccess) r.apply();
+            } else {
+                r.error = kPolicyError;
+                if (r.admission.allowed()) r.degraded = true;
             }
         } else {
             r.error = 0;
@@ -393,11 +428,12 @@ IOReturn AMDZenPM::nativeGateAction(OSObject *owner, void *op, void *a1, void *,
     d.commands = r.channel.commandCount(); d.latencyUs = r.channel.lastLatencyUs();
     d.error = r.error; d.cpuCount = r.topology.cpuCount; d.caps = r.caps[0];
     memcpy(d.requests, r.applied, sizeof(d.requests));
-    d.acPower = r.signals.system.powerSource; d.thermal = r.signals.system.thermal;
-    d.lowPower = r.signals.system.lowPowerMode;
+    d.acPower = r.effectiveSystem.powerSource; d.thermal = r.effectiveSystem.thermal;
+    d.lowPower = r.effectiveSystem.lowPowerMode;
     d.hookActive = zen::idle::nativeSignalsActive(); d.rtMask = 0; d.rtActive = 0;
     const uint64_t nowMs = nowNs() / 1000000;
-    const uint32_t rtHoldMs = zennative::defaultTunables().rtHoldMs;
+    const uint32_t rtHoldMs = zennative::tunablesForProfile(
+        static_cast<zennative::CpuProfile>(r.profile)).rtHoldMs;
     for (uint32_t c = 0; c < d.cpuCount; ++c) {
         const zennative::CpuHistory &h = r.policy.cpu[c];
         if ((r.signals.cpus[c].observed && r.signals.cpus[c].urgency == zennative::kUrgencyRealtime) ||
@@ -499,4 +535,141 @@ void AMDZenPM::nativeFree() {
 IOReturn AMDZenPM::copyNativeDiagnostics(NativeDiagnostics *out) {
     if (!out || !gate) return kIOReturnNotReady;
     return gate->runAction(nativeGateAction, (void *)kCopy, out);
+}
+
+void AMDZenPM::nativeResetMsr() {
+    if (!native) return;
+    zennative::reset(native->policy);
+    native->idleValid = false;
+    native->tdieThermal = zennative::kThermalUnknown;
+    native->quietTicks = 0;
+    native->signals.polled = false;
+}
+
+bool AMDZenPM::nativeLegacyPowerSave() {
+    if (!native) return false;
+    NativeRuntime &r = *native;
+    const uint64_t nowMs = nowNs() / 1000000;
+    const uint32_t ncpu = minU(cpu.topo().ncpu, zenpcc::kMaxCpus);
+    if (!r.signals.polled || nowMs < r.signals.lastPollMs || nowMs - r.signals.lastPollMs >= 1000)
+        zennative::snapshotSignals(r.signals, nowMs, ncpu);
+    r.acOverride = __atomic_load_n(&acPowerMode, __ATOMIC_RELAXED);
+    r.lpm = __atomic_load_n(&lpmMode, __ATOMIC_RELAXED);
+    r.thermalMode = __atomic_load_n(&thermalCapMode, __ATOMIC_RELAXED);
+    r.tdie_mC = __atomic_load_n(&lastTdie_mC, __ATOMIC_RELAXED);
+    r.tjMax_mC = info ? info->tjMax_mC : 0;
+    r.updateEffectiveSignals();
+    nativeDiag.acPower = r.effectiveSystem.powerSource;
+    nativeDiag.thermal = r.effectiveSystem.thermal;
+    nativeDiag.lowPower = r.effectiveSystem.lowPowerMode;
+    return r.effectiveSystem.powerSource == zennative::kPowerInternal ||
+           r.effectiveSystem.lowPowerMode == zennative::kOn;
+}
+
+bool AMDZenPM::nativeStepCppcMsr() {
+    if (!native || !info || !cppcReq) return false;
+    NativeRuntime &r = *native;
+    const zen::Topology &tp = cpu.topo();
+    const uint32_t ncpu = minU(tp.ncpu, zenpcc::kMaxCpus);
+    if (!ncpu) return false;
+
+    const uint32_t lowest = info->cppcLowest;
+    const uint32_t nominal = info->cppcNominal >= lowest ? info->cppcNominal : lowest;
+    uint32_t highest = info->cppcEffectiveHighest ? info->cppcEffectiveHighest : info->cppcHighest;
+    if (highest < nominal) highest = nominal;
+    uint32_t lnl = info->cppcLowestNonlinear;
+    if (lnl < lowest || lnl > nominal) lnl = lowest;
+    const zencppc::Caps sharedCap {highest, nominal, lnl, lowest, info->baseFreqMHz, 0};
+    if (!zennative::validCaps(sharedCap)) return false;
+
+    r.topology.cpuCount = ncpu;
+    for (uint32_t c = 0; c < ncpu; ++c) {
+        r.topology.domainOfCpu[c] = tp.coreOfCpu[c];
+        r.caps[c] = sharedCap;
+        r.bootBoostDisabled[c] = cpu.bootBoostDisabled(c);
+    }
+
+    const uint64_t nowMs = nowNs() / 1000000;
+    r.baseEpp = epp;
+    r.boost = boostMode;
+    r.lpm = __atomic_load_n(&lpmMode, __ATOMIC_RELAXED);
+    r.acOverride = __atomic_load_n(&acPowerMode, __ATOMIC_RELAXED);
+    r.thermalMode = __atomic_load_n(&thermalCapMode, __ATOMIC_RELAXED);
+    r.profile = __atomic_load_n(&profileActive, __ATOMIC_RELAXED);
+    r.tdie_mC = __atomic_load_n(&lastTdie_mC, __ATOMIC_RELAXED);
+    r.tjMax_mC = info->tjMax_mC;
+    r.fast = limitFast;
+    r.slow = limitSlow;
+
+    zennative::Tunables t = zennative::tunablesForProfile(
+        static_cast<zennative::CpuProfile>(r.profile));
+    t.baseEpp = r.baseEpp;
+
+    zennative::snapshotSignals(r.signals, nowMs, ncpu);
+    if (zen::idle::active()) {
+        zen::idle::snapshot(r.idleCur, ncpu);
+        const bool resetIdle = !r.idleValid;
+        r.idleValid = true;
+        for (uint32_t c = 0; c < ncpu; ++c) {
+            const zen::IdleWindow w = zen::idleWindowAdvance(&r.idlePrev[c], r.idleCur[c], resetIdle);
+            if (w.status == zen::kIdleSampleReady) {
+                r.signals.cpus[c].busyPermille = static_cast<uint16_t>(w.busyPermille);
+                r.signals.cpus[c].busyObserved = true;
+            }
+        }
+    } else {
+        r.idleValid = false;
+    }
+    r.updateEffectiveSignals();
+
+    if (!zennative::tick(r.policy, r.topology, r.signals.cpus, r.effectiveSystem,
+                         r.caps, t, nowMs, r.result))
+        return false;
+
+    bool anyBusy = r.result.changedCount != 0;
+    for (uint32_t c = 0; c < ncpu; ++c) {
+        amdzen::DomainBounds b {};
+        if (!zennative::cpuValid(r.result, c) ||
+            !amdzen::domainBounds(r.topology, r.caps, r.bootBoostDisabled, r.boost, c, b))
+            return false;
+        zencppc::Request req = r.result.requests[c];
+        if (!amdzen::restrictRequest(req, b, r.fast, r.slow)) return false;
+        r.applied[c] = req;
+        const uint64_t raw = zen::encodeCppcReq(cpu.cppcReqInitial(c),
+                                                req.maxPerf, req.minPerf, 0, req.epp);
+        if (raw != cppcReq[c]) {
+            cppcReq[c] = raw;
+            reqDirty = true;
+        }
+        const auto &cs = r.signals.cpus[c];
+        if ((cs.observed && (cs.urgency == zennative::kUrgencyRealtime ||
+                             cs.urgency == zennative::kUrgencyNormal)) ||
+            (cs.busyObserved && cs.busyPermille >= 100)) {
+            anyBusy = true;
+        }
+    }
+    if (anyBusy) r.quietTicks = 0;
+    else if (r.quietTicks < 100) ++r.quietTicks;
+
+    NativeDiagnostics &d = nativeDiag;
+    d.cpuCount = ncpu;
+    d.caps = sharedCap;
+    memcpy(d.requests, r.applied, sizeof(d.requests));
+    d.acPower = r.effectiveSystem.powerSource;
+    d.thermal = r.effectiveSystem.thermal;
+    d.lowPower = r.effectiveSystem.lowPowerMode;
+    d.hookActive = zen::idle::nativeSignalsActive();
+    d.rtMask = 0;
+    d.rtActive = 0;
+    for (uint32_t c = 0; c < ncpu; ++c) {
+        const zennative::CpuHistory &h = r.policy.cpu[c];
+        if ((r.signals.cpus[c].observed && r.signals.cpus[c].urgency == zennative::kUrgencyRealtime) ||
+            (h.hasRt && nowMs >= h.lastRtMs && nowMs - h.lastRtMs < t.rtHoldMs)) {
+            d.rtMask |= 1ull << c;
+            ++d.rtActive;
+        }
+    }
+    d.stage = kActive;
+    nativeIntervalMs = (r.quietTicks >= 10 && d.rtActive == 0) ? 200u : 50u;
+    return true;
 }
